@@ -1,0 +1,2 @@
+ninja: Entering directory `C:\Users\greg7\AndroidStudioProjects\SensorToMatlab\opencv\.cxx\Debug\5v3j2535\x86_64'
+ninja: no work to do.
