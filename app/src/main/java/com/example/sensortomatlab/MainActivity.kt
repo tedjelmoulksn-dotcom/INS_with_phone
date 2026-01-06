@@ -26,7 +26,7 @@ import kotlin.math.*
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
     // =================== USER PARAMS ===================
-    private val PX_PER_M = 20.0f       // calibration px/m
+    private val PX_PER_M = 14.69f       // calibration px/m
     private val STEP_LEN_M = 0.65f     // longueur de pas moyenne
     private val STEP_LEN_PX = PX_PER_M * STEP_LEN_M
 
@@ -147,6 +147,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var usingGameRV = false
     private val sendFrameTimestamp = true
 
+    private var yawRawDeg0 = -1000f
     private var lastYawRawDeg = 0f
     private var lastYawSmoothDeg = 0f
 
@@ -175,7 +176,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val stepZScoreMin = 2.5f
     private val stepProminenceMin = 0.15f
     private val stepZeroCrossTimeoutMs = 400L
-    private val minStepDelay = 250
+    private val minStepDelay = 150
     private val accelStatsWindow = 120
     private val gyroStatsWindow = 40
     private val minGyroVar = 0.02f
@@ -457,6 +458,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val DBG = true
     private val DBG_PERIOD_MS = 300L
     private var lastDbgTime = 0L
+    private var lastDrawMs = 0L
+    private val minDrawIntervalMs = 33L
 
     // Timer: envoi yaw en continu mmm sans marcher (vite timeout Matlab)
     private val yawTickMs = 50L
@@ -653,41 +656,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         handler.postDelayed(yawTick, yawTickMs)
     }
     private fun getYawSmoothAbsDegOrNull(): Float? {
-        if (rv[0] == 0f && rv[1] == 0f && rv[2] == 0f) return null
-
-        SensorManager.getRotationMatrixFromVector(R, rv)
-
-        @Suppress("DEPRECATION")
-        val rot = windowManager.defaultDisplay.rotation
-        val (axisX, axisY) = when (rot) {
-            Surface.ROTATION_0 -> Pair(SensorManager.AXIS_X, SensorManager.AXIS_Y)
-            Surface.ROTATION_90 -> Pair(SensorManager.AXIS_Y, SensorManager.AXIS_MINUS_X)
-            Surface.ROTATION_180 -> Pair(SensorManager.AXIS_MINUS_X, SensorManager.AXIS_MINUS_Y)
-            Surface.ROTATION_270 -> Pair(SensorManager.AXIS_MINUS_Y, SensorManager.AXIS_X)
-            else -> Pair(SensorManager.AXIS_X, SensorManager.AXIS_Y)
-        }
-        SensorManager.remapCoordinateSystem(R, axisX, axisY, Rr)
-        SensorManager.getOrientation(Rr, ori)
-
-        val yawRawDeg0 = Math.toDegrees(ori[0].toDouble()).toFloat()
-        val pitchDeg = Math.toDegrees(ori[1].toDouble()).toFloat()
-
-        // mÃªme rejet que toi
-        if (abs(pitchDeg) > 70f) return null
-
-        var yawRawDeg = normalizeAngle(yawRawDeg0)
-        if (INVERT_YAW) yawRawDeg = -yawRawDeg
-
-        // lissage circulaire (identique)
-        val yawRawRad = Math.toRadians(yawRawDeg.toDouble()).toFloat()
-        val s = sin(yawRawRad)
-        val c = cos(yawRawRad)
-        yawSinF = (1f - yawAlpha) * yawSinF + yawAlpha * s
-        yawCosF = (1f - yawAlpha) * yawCosF + yawAlpha * c
-
-        val yawSmoothRad = atan2(yawSinF, yawCosF)
-        return normalizeAngle(Math.toDegrees(yawSmoothRad.toDouble()).toFloat())
+        return if (yawRawDeg0 > -999f) yawRawDeg0 else null
     }
+
 
     override fun onResume() {
         super.onResume()
@@ -880,64 +851,147 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     // =================== PATH ===================
+    private fun snapToWalkable(p: PointF, radius: Int = 20): PointF {
+        val x0 = p.x.toInt()
+        val y0 = p.y.toInt()
+        if (isWalkable(x0, y0)) return p
+
+        // Simple spiral search around the point
+        for (r in 1..radius) {
+            for (dy in -r..r) {
+                val y = (y0 + dy).coerceIn(0, bmpPlan.height - 1)
+                val x1 = (x0 - r).coerceIn(0, bmpPlan.width - 1)
+                val x2 = (x0 + r).coerceIn(0, bmpPlan.width - 1)
+                if (isWalkable(x1, y)) return PointF(x1.toFloat(), y.toFloat())
+                if (isWalkable(x2, y)) return PointF(x2.toFloat(), y.toFloat())
+            }
+            for (dx in -r..r) {
+                val x = (x0 + dx).coerceIn(0, bmpPlan.width - 1)
+                val y1 = (y0 - r).coerceIn(0, bmpPlan.height - 1)
+                val y2 = (y0 + r).coerceIn(0, bmpPlan.height - 1)
+                if (isWalkable(x, y1)) return PointF(x.toFloat(), y1.toFloat())
+                if (isWalkable(x, y2)) return PointF(x.toFloat(), y2.toFloat())
+            }
+        }
+        // Fallback: return original point
+        return p
+    }
+
     private fun computePathAsync() {
-        val s = startPoint ?: return
-        val e = endPoint ?: return
+        val s0 = startPoint ?: return
+        val e0 = endPoint ?: return
+        val s = snapToWalkable(s0)
+        val e = snapToWalkable(e0)
 
         pathExec.execute {
             try {
-                // ✅ Chemin direct comme MATLAB (ligne droite)
-                val computed = listOf(s, e)
+                // 1) A* path on walkable grid
+                val raw = runAStar(s, e)
+                if (raw.size < 2) {
+                    Log.w(TAG, "A* returned empty/too short path")
+                    runOnUiThread { Toast.makeText(this, "A* no path", Toast.LENGTH_LONG).show() }
+                    return@execute
+                }
 
-                // heading0Abs
-                val a = computed[0]
-                val b = computed[1]
-                val dx0 = (b.x - a.x)
-                val dy0 = (b.y - a.y)
+                // 2) Optional smoothing
+                val computed = smoothPath(raw)
+                if (computed.size < 2) {
+                    Log.w(TAG, "Smoothed path too short")
+                    runOnUiThread { Toast.makeText(this, "Path invalid", Toast.LENGTH_LONG).show() }
+                    return@execute
+                }
+
+                // 3) Initial heading
+                val a0 = computed[0]
+                val b0 = computed[1]
+                val dx0 = (b0.x - a0.x)
+                val dy0 = (b0.y - a0.y)
                 val h0 = normalizeAngle(
                     Math.toDegrees(atan2(dx0.toDouble(), (-dy0).toDouble())).toFloat()
                 )
 
-                // ✅ distance px comme MATLAB
+                // 4) MATLAB logic: keep path length for navigation, estimate straight distance for steps
                 val cd = buildCumDistLocal(computed)
                 val totalPx = cd.last().coerceAtLeast(0f)
+                val start = computed.first()
+                val end = computed.last()
+                val dx = end.x - start.x
+                val dy = end.y - start.y
+                val straightDistPx = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                val distanceM = straightDistPx / PX_PER_M
+                val steps = max(1, round(distanceM / STEP_LEN_M).toInt())
 
-                // ✅ conversion mètres comme MATLAB: distance_m = distance_px / 20
-                val distanceM = totalPx / PX_PER_M
+                // 5) Turn events
+                val turns = computeTurnEventsByDistance(computed, cd)
 
-                // ✅ totalSteps comme MATLAB
-                val steps  = max(1, round(distanceM / STEP_LEN_M).toInt())
-
-                // publish
+                // 6) Publish navigation state
                 pathResult = computed
                 drPosPx = PointF(s.x, s.y)
                 drHasPos = true
+
                 heading0Abs = h0
                 heading0Ready = true
+                // On initialise yawFiltered des que possible a la direction du premier segment
+                val yawAbsSmooth = getYawSmoothAbsDegOrNull()
+                if (yawAbsSmooth != null) {
+                    yawSmoothPrevDeg = yawAbsSmooth
+                    yawAbsContDeg = yawAbsSmooth
+                    yawOffsetContDeg = yawAbsContDeg - heading0Abs
+                    yawOffset = normalizeAngle(yawAbsSmooth)
+                    yawFiltered = heading0Abs
+                    yawInit = true
+                    lastYawTime = System.currentTimeMillis()
+                    yawOffsetLockedToPath = true
+
+                    Log.i(
+                        TAG,
+                        "YAW PRE-LOCK: yawAbs=%.1f heading0Abs=%.1f yawFiltered=%.1f"
+                            .format(Locale.US, yawAbsSmooth, heading0Abs, yawFiltered)
+                    )
+                } else {
+                    Log.w(TAG, "YAW PRE-LOCK skipped (no yawAbsSmooth)")
+                }
+
                 cumDistPx = cd
                 totalDistPx = totalPx
                 totalSteps = steps
-                turnEvents = emptyList()
+
+                turnEvents = turns
                 nextTurnIdx = 0
                 turnLockActive = false
                 lockOkCount = 0
+                pendingStepsWhileLocked = 0
 
+                // 7) Send to Matlab + UI
                 sendPathToMatlab(computed)
                 navigationActive = true
                 navState = NavState.READY
 
                 runOnUiThread {
-                    Toast.makeText(this, "path direct ready", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this,
+                        "A* ready: %.1fpx (%.1fm), steps=$totalSteps".format(
+                            Locale.US,
+                            straightDistPx,
+                            distanceM
+                        ),
+                        Toast.LENGTH_SHORT
+                    ).show()
                     draw()
                 }
 
+                Log.i(
+                    TAG,
+                    "A* PATH ready: n=${computed.size} straightPx=%.1f distanceM=%.2f totalSteps=%d turns=%d"
+                        .format(Locale.US, straightDistPx, distanceM, totalSteps, turns.size)
+                )
+
             } catch (t: Throwable) {
-                Log.e(TAG, "computePath error", t)
-                runOnUiThread { Toast.makeText(this, "Error", Toast.LENGTH_LONG).show() }
+                Log.e(TAG, "computePath(A*) error", t)
+                runOnUiThread { Toast.makeText(this, "Error path", Toast.LENGTH_LONG).show() }
             }
         }
     }
-
 
     private fun buildCumDistLocal(path: List<PointF>): FloatArray {
         val n = path.size
@@ -961,8 +1015,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 usingGameRV = false
                 lastYawSource = "ROT"
                 System.arraycopy(e.values, 0, rv, 0, min(e.values.size, rv.size))
+                getYawFiltered()
                 if (navigationActive && navState == NavState.RUNNING && !turnLockActive) {
                     processNavigationLogic(trigger = "RV")
+                }
+
+                if (drHasPos) {
+                    requestDraw()
                 }
 
                 return
@@ -973,6 +1032,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 usingGameRV = true
                 lastYawSource = "GAME"
                 System.arraycopy(e.values, 0, rv, 0, min(e.values.size, rv.size))
+                getYawFiltered()
                 if (navigationActive && navState == NavState.RUNNING && !turnLockActive) {
                     processNavigationLogic(trigger = "RV")
                 }
@@ -981,6 +1041,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 lastGameQuatY = e.values[1]
                 lastGameQuatZ = e.values[2]
                 lastGameQuatW = if (e.values.size > 3) e.values[3] else 0f
+
+                if (drHasPos) {
+                    requestDraw()
+                }
 
                 return
             }
@@ -1316,7 +1380,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // Orientation: azimuth(yaw), pitch, roll en radians
         SensorManager.getOrientation(Rr, ori)
 
-        val yawRawDeg0 = Math.toDegrees(ori[0].toDouble()).toFloat()
+        yawRawDeg0 = Math.toDegrees(ori[0].toDouble()).toFloat()
         val pitchDeg = Math.toDegrees(ori[1].toDouble()).toFloat()
         val rollDeg = Math.toDegrees(ori[2].toDouble()).toFloat()
 
@@ -1353,15 +1417,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
 
         if (!yawInit) {
-            // offset continu = yaw actuel (donc yawRel=0 au dÃ©part, ou remplacÃ© ensuite par ton "lock to path")
-            yawOffsetContDeg = yawAbsContDeg
-            yawOffset = normalizeAngle(yawSmoothDeg) // juste pour log/compat
-            yawInit = true
             yawFiltered = 0f
-            lastYawTime = now
-            Log.i(TAG, "YAW INIT (cont) yawAbsCont=%.1f smooth=%.1f pitch=%.1f roll=%.1f"
-                .format(Locale.US, yawAbsContDeg, yawSmoothDeg, pitchDeg, rollDeg))
-            return 0f
+            return yawFiltered
         }
 
 // yaw relatif (continu) puis ramenÃ© dans [-180,180] pour comparaison/affichage
@@ -1457,7 +1514,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 udpSendLine("DBGSTEP,PEAK,f=%.4f,th=%.4f,mu=%.4f,sd=%.4f,z=%.2f,prom=%b".format(Locale.US,lastFilt,thresh,meanAbs,stdAbs,z, prominenceOk))
             }
         } else {
-            val eps=0.02f
+            val eps=0.01f
             if (abs(filt) <= eps ||(lastFilt>0 && filt <0)||(lastFilt < 0 && filt > 0)) {
 
                 val gyroOk = gyroWinCount == 0 || gyroVar >= minGyroVar
@@ -1558,8 +1615,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val stepPx = STEP_LEN_PX * steps
         val rad = Math.toRadians(yawRel.toDouble())
         val dx = (stepPx * sin(rad)).toFloat()
-        val dy = (-stepPx * cos(rad)).toFloat()
+        val dy = -(stepPx * cos(rad)).toFloat()
         drPosPx.offset(dx, dy)
+
+
     }
 
     private fun updateMapMatching() {
@@ -1734,7 +1793,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val y = (-cos(rad)).toFloat()
         return PointF(x, y)
     }
-    private fun drawStartMarker(c: Canvas, p: PointF) {
+    private fun angleToTarget(from: PointF, to: PointF): Float {
+        val dx = (to.x - from.x)
+        val dy = (to.y - from.y)
+        return normalizeAngle(
+            Math.toDegrees(atan2(dx.toDouble(), (-dy).toDouble())).toFloat()
+        )
+    }
+
+    private fun drawStartMarker(c: Canvas, p: PointF, angleDeg: Float?) {
         val s = 16f
         val path = Path().apply {
             moveTo(p.x, p.y - s)
@@ -1744,10 +1811,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         c.save()
         c.translate(2f, 2f)
+        if (angleDeg != null) {
+            c.rotate(angleDeg, p.x, p.y)
+        }
         c.drawPath(path, paintMarkerShadow)
         c.restore()
+        c.save()
+        if (angleDeg != null) {
+            c.rotate(angleDeg, p.x, p.y)
+        }
         c.drawPath(path, paintMarkerOutline)
         c.drawPath(path, paintStartMarker)
+        c.restore()
     }
 
     private fun drawEndMarker(c: Canvas, p: PointF) {
@@ -2185,8 +2260,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         overlayCanvas.drawRect(0f, 0f, bmpOverlay.width.toFloat(), bmpOverlay.height.toFloat(), paintClear)
 
         // points
-        startPoint?.let { drawStartMarker(overlayCanvas, it) }
-        endPoint?.let { drawEndMarker(overlayCanvas, it) }
+        val end = endPoint
+        startPoint?.let { sp ->
+            val angleToEnd = end?.let { angleToTarget(sp, it) }
+            drawStartMarker(overlayCanvas, sp, angleToEnd)
+        }
+        end?.let { drawEndMarker(overlayCanvas, it) }
 
         // path + progress
         val path = pathResult
@@ -2235,6 +2314,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         composedCanvas.drawBitmap(bmpOverlay,0f,0f, null )
         imageView.setImageBitmap(bmpComposed)
         imageView.imageMatrix = imageMatrixCurrent
+    }
+
+    private fun requestDraw() {
+        val now = System.currentTimeMillis()
+        if (now - lastDrawMs < minDrawIntervalMs) return
+        lastDrawMs = now
+        imageView.post { draw() }
     }
 
     // =================== VIBRATE ===================
