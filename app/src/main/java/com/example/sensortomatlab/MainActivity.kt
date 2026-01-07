@@ -181,6 +181,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val gyroStatsWindow = 40
     private val minGyroVar = 0.02f
 
+    // =================== STEP TIMING (NEW) ===================
+    private var stepPeriodMs = 550f
+    private var lastStepAcceptedMs = 0L
+    private var dtStepMs = 0L
+    private val stepPeriodAlpha = 0.15f
+    private val stepPeriodMinMs = 250f
+    private val stepPeriodMaxMs = 1200f
+    private val minDelayFrac = 0.40f
+    private val zeroCrossFrac = 0.90f
+    private val stepLenAlpha = 0.40f
+    private val stepRefPeriodMs = 550f
+    private val stepRefLenM = STEP_LEN_M
+    private val stepLenMinM = 0.35f
+    private val stepLenMaxM = 0.95f
+
     private var lastAccelTsNs = 0L
     private var accelFs = 50f
     private val accelFilter = BiquadBandpass()
@@ -218,6 +233,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // position estime sur la carte
     @Volatile private var distNowPx = 0f
     @Volatile private var ratioNow = 0f
+    @Volatile private var distAlongPx = 0f
 
     // =================== YAW FILTER ===================
     private val rv = FloatArray(5)
@@ -753,6 +769,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         totalSteps = 0
         distNowPx = 0f
         ratioNow = 0f
+        distAlongPx = 0f
         pathResult = emptyList()
 
         // steps
@@ -776,6 +793,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         waitingZeroCross = false
         peakTimeMs = 0L
         lastStepTimeMs = 0L
+        lastStepAcceptedMs = 0L
+        dtStepMs = 0L
+        stepPeriodMs = stepRefPeriodMs
         accelWinCount = 0
         accelWinIdx = 0
         accelSum = 0f
@@ -910,7 +930,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     Math.toDegrees(atan2(dx0.toDouble(), (-dy0).toDouble())).toFloat()
                 )
 
-                // 4) MATLAB logic: keep path length for navigation, estimate straight distance for steps
+                // 4) MATLAB logic: use path length for steps (coherent with distNowPx)
                 val cd = buildCumDistLocal(computed)
                 val totalPx = cd.last().coerceAtLeast(0f)
                 val start = computed.first()
@@ -918,7 +938,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val dx = end.x - start.x
                 val dy = end.y - start.y
                 val straightDistPx = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-                val distanceM = straightDistPx / PX_PER_M
+                val distanceM = totalPx / PX_PER_M
                 val steps = max(1, round(distanceM / STEP_LEN_M).toInt())
 
                 // 5) Turn events
@@ -972,7 +992,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         this,
                         "A* ready: %.1fpx (%.1fm), steps=$totalSteps".format(
                             Locale.US,
-                            straightDistPx,
+                            totalPx,
                             distanceM
                         ),
                         Toast.LENGTH_SHORT
@@ -982,8 +1002,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
                 Log.i(
                     TAG,
-                    "A* PATH ready: n=${computed.size} straightPx=%.1f distanceM=%.2f totalSteps=%d turns=%d"
-                        .format(Locale.US, straightDistPx, distanceM, totalSteps, turns.size)
+                    "A* PATH ready: n=${computed.size} totalPx=%.1f straightPx=%.1f distanceM=%.2f totalSteps=%d turns=%d"
+                        .format(Locale.US, totalPx, straightDistPx, distanceM, totalSteps, turns.size)
                 )
 
             } catch (t: Throwable) {
@@ -1153,10 +1173,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         }
 
                         sentStepCount++
+                        distAlongPx = min(totalDistPx, distAlongPx + STEP_LEN_PX)
                         val nowMs = System.currentTimeMillis()
                         udpSendLine("STEP_EVT,$sentStepCount,$nowMs")
-                        updateDeadReckoning(getYawFiltered(), 1)
-                        updateMapMatching()
+                        updatePositionFromAlongDistance()
+                        Log.i(
+                            TAG,
+                            "STEP stepPx=$STEP_LEN_PX distAlongPx=$distAlongPx distNowPx=$distNowPx total=$totalDistPx"
+                        )
 
                         udpSendLine("STEP,$sentStepCount")
                         processNavigationLogic(trigger = "STEP")
@@ -1487,6 +1511,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun detectStepFromAccel(filt: Float, tsNs: Long): Boolean {
         val nowMs = tsNs / 1_000_000L
+        val dynMinDelayMs = max(minStepDelay.toFloat(), minDelayFrac * stepPeriodMs).toLong()
+        val dynZeroCrossTimeoutMs = max(stepZeroCrossTimeoutMs.toFloat(), zeroCrossFrac * stepPeriodMs).toLong()
         val absFilt = abs(filt)
         val (meanAbs, stdAbs) = updateAccelStats(absFilt)
         val thresh = meanAbs + stepThreshK * stdAbs
@@ -1507,30 +1533,44 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (!waitingZeroCross) {
 
             val peakOk = abs(lastFilt) > thresh && (prominenceOk || zOk)
-            if (lastDeriv > 0f && deriv <= 0f && peakOk && nowMs - lastStepTimeMs > minStepDelay.toLong()) {
+            val sinceLast = nowMs - lastStepAcceptedMs
+            if (lastDeriv > 0f && deriv <= 0f && peakOk && sinceLast > dynMinDelayMs) {
                 waitingZeroCross = true
                 peakTimeMs = nowMs
                 // debbug pour les pas perdu
-                udpSendLine("DBGSTEP,PEAK,f=%.4f,th=%.4f,mu=%.4f,sd=%.4f,z=%.2f,prom=%b".format(Locale.US,lastFilt,thresh,meanAbs,stdAbs,z, prominenceOk))
+                udpSendLine(
+                    "DBGSTEP,PEAK,f=%.4f,th=%.4f,mu=%.4f,sd=%.4f,z=%.2f,prom=%b,T=%.0f,dt=%d,min=%d"
+                        .format(Locale.US, lastFilt, thresh, meanAbs, stdAbs, z, prominenceOk, stepPeriodMs, sinceLast, dynMinDelayMs)
+                )
             }
         } else {
-            val eps=0.01f
+            val eps = 0.01f
             if (abs(filt) <= eps ||(lastFilt>0 && filt <0)||(lastFilt < 0 && filt > 0)) {
 
                 val gyroOk = gyroWinCount == 0 || gyroVar >= minGyroVar
-                if (gyroOk && nowMs - lastStepTimeMs > minStepDelay.toLong()) {
+                val sinceLast = nowMs - lastStepAcceptedMs
+                if (gyroOk && sinceLast > dynMinDelayMs) {
                     stepDetected = true
+
+                    if (lastStepAcceptedMs != 0L) {
+                        dtStepMs = nowMs - lastStepAcceptedMs
+                        val dtClamped = dtStepMs.toFloat().coerceIn(stepPeriodMinMs, stepPeriodMaxMs)
+                        stepPeriodMs = (1f - stepPeriodAlpha) * stepPeriodMs + stepPeriodAlpha * dtClamped
+                    }
+
+                    lastStepAcceptedMs = nowMs
                     lastStepTimeMs = nowMs
                     if (DBG) {
                         Log.w(
                             TAG,
-                            "STEPDBG filt=%.5f thresh=%.5f deriv=%.5f".format(Locale.US, filt, thresh, deriv)
+                            "STEP OK dt=%dms T=%.0fms min=%dms zt=%dms"
+                                .format(Locale.US, sinceLast, stepPeriodMs, dynMinDelayMs, dynZeroCrossTimeoutMs)
                         )
                     }
                 }
                 waitingZeroCross = false
-            } else if (nowMs - peakTimeMs > stepZeroCrossTimeoutMs) {
-                udpSendLine("DBGSTEP,TIMEOUT,f=%.4f".format(Locale.US, filt))
+            } else if (nowMs - peakTimeMs > dynZeroCrossTimeoutMs) {
+                udpSendLine("DBGSTEP,TIMEOUT,f=%.4f,T=%.0f,zt=%d".format(Locale.US, filt, stepPeriodMs, dynZeroCrossTimeoutMs))
                 waitingZeroCross = false
             }
         }
@@ -1612,7 +1652,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             drPosPx = PointF(s.x, s.y)
             drHasPos = true
         }
-        val stepPx = STEP_LEN_PX * steps
+        val ratio = (stepRefPeriodMs / stepPeriodMs).toDouble()
+        val stepLenMdyn = (stepRefLenM * ratio.pow(stepLenAlpha.toDouble())).toFloat()
+            .coerceIn(stepLenMinM, stepLenMaxM)
+        val stepPx = (PX_PER_M * stepLenMdyn) * steps
         val rad = Math.toRadians(yawRel.toDouble())
         val dx = (stepPx * sin(rad)).toFloat()
         val dy = -(stepPx * cos(rad)).toFloat()
@@ -1621,37 +1664,41 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     }
 
-    private fun updateMapMatching() {
+    private fun updatePositionFromAlongDistance() {
+        val path = pathResult
+        val cd = cumDistPx
+        if (path.size < 2 || cd.size != path.size) return
         val total = totalDistPx
         if (total <= 0f) return
-        if (!drHasPos) return
 
-        if (!USE_MAP_MATCHING) {
-            distNowPx = min(total, sentStepCount * STEP_LEN_PX)
-            ratioNow = (distNowPx / total).coerceIn(0f, 1f)
-            return
-        }
-
-        val proj = projectOnPath(drPosPx) ?: return
-        lastProjDistPx = proj.dist
-        val yawVar = computeYawVariance()
-        val lambda = computeMapMatchLambda(yawVar)
-        lastMapMatchLambda = lambda
-        if (proj.dist > mapMatchThresholdPx) {
-            drPosPx = PointF(
-                lambda * drPosPx.x + (1f - lambda) * proj.point.x,
-                lambda * drPosPx.y + (1f - lambda) * proj.point.y
-            )
-        }
-        distNowPx = proj.alongDist.coerceIn(0f, total)
+        distNowPx = distAlongPx.coerceIn(0f, total)
         ratioNow = (distNowPx / total).coerceIn(0f, 1f)
+
+        val maxSeg = path.size - 2
+        val segIdx = findSegmentIndexByDistance(cd, distNowPx).coerceIn(0, maxSeg)
+        val a = path[segIdx]
+        val b = path[segIdx + 1]
+
+        val segStart = cd[segIdx]
+        val segEnd = cd[segIdx + 1]
+        val segLen = max(1e-6f, segEnd - segStart)
+        val t = ((distNowPx - segStart) / segLen).coerceIn(0f, 1f)
+
+        val px = a.x + t * (b.x - a.x)
+        val py = a.y + t * (b.y - a.y)
+
+        drPosPx = PointF(px, py)
+        drHasPos = true
     }
 
     private fun applyPendingSteps() {
         if (pendingStepsWhileLocked <= 0) return
         sentStepCount += pendingStepsWhileLocked
-        updateDeadReckoning(getYawFiltered(), pendingStepsWhileLocked)
-        updateMapMatching()
+        distAlongPx = min(
+            totalDistPx,
+            distAlongPx + STEP_LEN_PX * pendingStepsWhileLocked
+        )
+        updatePositionFromAlongDistance()
         pendingStepsWhileLocked = 0
     }
 
