@@ -26,7 +26,7 @@ import kotlin.math.*
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
     // =================== USER PARAMS ===================
-    private val PX_PER_M = 14.69f       // calibration px/m
+    private val PX_PER_M = 31.06f       // calibration px/m
     private val STEP_LEN_M = 0.65f     // longueur de pas moyenne
     private val STEP_LEN_PX = PX_PER_M * STEP_LEN_M
 
