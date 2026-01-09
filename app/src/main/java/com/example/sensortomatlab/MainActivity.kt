@@ -1,6 +1,7 @@
 ﻿package com.example.sensortomatlab
 
 import android.graphics.*
+import android.graphics.drawable.GradientDrawable
 import android.hardware.*
 import android.os.*
 import android.util.Log
@@ -9,9 +10,13 @@ import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.ViewConfiguration
+import android.view.View
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import java.io.BufferedWriter
@@ -25,10 +30,29 @@ import kotlin.math.*
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
+    // =================== RECORDING / APP STATE ===================
+    // Pas detectes seulement quand on "enregistre" (calib) ou quand la nav est RUNNING.
+    @Volatile private var stepDetectionEnabled = false
+
     // =================== USER PARAMS ===================
     private val PX_PER_M = 31.06f       // calibration px/m
     private val STEP_LEN_M = 0.65f     // longueur de pas moyenne
-    private val STEP_LEN_PX = PX_PER_M * STEP_LEN_M
+    // STEP_LEN_PX supprimé : on utilise toujours stepLenPxNow() (basé sur l'étalonnage user)
+    private fun stepLenPxNow(): Float = PX_PER_M * stepLenMUser
+    private fun stepLenMdynNow(): Float {
+        val ratioT = (stepRefPeriodMsUser / stepPeriodMs).toDouble()
+        val cadenceFactor = ratioT.pow(0.20)
+
+        val ampRatio = (lastStepAmpAbs / stepAmpRefUser).toDouble().coerceIn(0.6, 1.6)
+        val ampFactor = ampRatio.pow(0.25)
+
+        val stepLen = stepRefLenMUser * cadenceFactor * ampFactor
+        return stepLen.toFloat().coerceIn(stepLenMinM, stepLenMaxM)
+    }
+    private fun stepLenPxDynNow(): Float = PX_PER_M * stepLenMdynNow()
+    private fun cadenceSpmNow(): Float = (60000f / stepPeriodMs).coerceIn(40f, 260f)
+    private fun cadenceSpmInstant(): Float =
+        if (dtStepMs > 0) (60000f / dtStepMs.toFloat()).coerceIn(40f, 260f) else cadenceSpmNow()
 
     // Si yawRel part toujours dans le mÃªme sens (gauche/droite), mets true
     private val INVERT_YAW = false
@@ -121,6 +145,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val paintCompassSeg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GREEN; strokeWidth = 4f }
     private val paintCompassText = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 24f }
 
+    private lateinit var alignButton: Button
+    private lateinit var calibButton: Button
+    private lateinit var calibStopButton: Button
+    private lateinit var introPanel: FrameLayout
+    private lateinit var introTitle: TextView
+    private lateinit var introBody: TextView
+    private lateinit var introStats: TextView
+    private var introVisible = true
+
     private lateinit var vibrator: Vibrator
 
     // =================== MAP / PATH ===================
@@ -170,16 +203,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var lastGameQuatW = 0f
 
     // step detection (band-pass + peak/zero-cross)
-    private val stepBandLowHz = 0.7f
+    // Marche lente: 0.7 Hz coupe parfois trop -> on descend à 0.5 Hz
+    private val stepBandLowHz = 0.25f
     private val stepBandHighHz = 3.0f
-    private val stepThreshK = 1.2f
-    private val stepZScoreMin = 2.5f
-    private val stepProminenceMin = 0.15f
-    private val stepZeroCrossTimeoutMs = 400L
-    private val minStepDelay = 150
+    // Un peu moins agressif pour ne pas rater les pas lents
+    private val stepThreshK = 0.14f          // plus sensible
+    private val stepProminenceMin = 0.045f   // petits pas
+    private val minStepDelay = 160           // evite double comptage (marche normale)
     private val accelStatsWindow = 120
     private val gyroStatsWindow = 40
     private val minGyroVar = 0.02f
+    // Si tu veux garder une sécurité gyro: on ne rejette que si mouvement très violent
+    private val gyroVarReject = 0.90f // a 0.60 cetait pas mal aussi
+
+    // Track du pic courant (pour valider même sans vrai zero-cross)
+    private var peakAbsHold = 0f
+    private var peakSignHold = 1
+    private var prevFilt = 0f
 
     // =================== STEP TIMING (NEW) ===================
     private var stepPeriodMs = 550f
@@ -187,14 +227,45 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var dtStepMs = 0L
     private val stepPeriodAlpha = 0.15f
     private val stepPeriodMinMs = 250f
-    private val stepPeriodMaxMs = 1200f
-    private val minDelayFrac = 0.40f
-    private val zeroCrossFrac = 0.90f
+    private val stepPeriodMaxMs = 2600f
+    // Marche lente: minDelay en fraction un peu plus bas (sinon cercle vicieux si T dérive)
+    private val minDelayFrac = 0.22f
+    // Marche lente: la “retombée/validation” peut être plus longue
+    private val zeroCrossFrac = 1.30f
     private val stepLenAlpha = 0.40f
     private val stepRefPeriodMs = 550f
     private val stepRefLenM = STEP_LEN_M
     private val stepLenMinM = 0.35f
     private val stepLenMaxM = 0.95f
+    private var lastStepAmpAbs = 0.12f
+    private val calibStepAmps = ArrayList<Float>(64)
+    private var stepAmpRefUser = 0.12f
+
+    // =================== CALIBRATION (NEW) ===================
+    private var calibActive = false
+    private var calibWaitingStart = true
+    private var calibStepCount = 0
+    private val calibStepTimes = ArrayList<Long>(64)
+    private var calibLastPeakMs = 0L
+    private var calibPeakArmed = true
+    private val calibStepThreshK = 1.2f
+    private val calibStepZMin = 2.5f
+    private val calibThreshMin = 1.2f          // post-filtrage
+    private val calibMinPeakIntervalMs = 400L
+    private val calibMaxRefPeriodMs = 1600f
+    private var stepRefPeriodMsUser = 550f
+    private var stepRefLenMUser = STEP_LEN_M
+    private var stepLenMUser = STEP_LEN_M
+    private val PREFS_NAME = "calibration_prefs"
+    private val PREF_STEP_LEN_M = "pref_step_len_m"
+    private val PREF_STEP_REF_PERIOD_MS = "pref_step_ref_period_ms"
+    private val PREF_STEP_AMP_REF = "pref_step_amp_ref"
+    private val STEP_LEN_M_DEFAULT = STEP_LEN_M
+
+    // =================== CALIBRATION DISTANCE ===================
+    private val CALIB_DISTANCE_M = 5.0f
+    // =================== MAP PRELOAD ===================
+    @Volatile private var mapPreloadStarted = false
 
     private var lastAccelTsNs = 0L
     private var accelFs = 50f
@@ -286,8 +357,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // =================== YAW <-> MAP CALIB ===================
     private var heading0Abs = 0f
     private var heading0Ready = false
-    private lateinit var bmpComposed : Bitmap
-    private lateinit var composedCanvas : Canvas
 
     // conversion from abs degreee to real degree
     private fun absToRelMap(absDeg: Float): Float {
@@ -421,6 +490,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val turnGyroVarMin = 0.015f
     private var turnGyroSeen = false
 
+    // =================== TURN BY GYRO Z ONLY ===================
+    private var lastGyroZ = 0f
+    private var gyroZFiltered = 0f
+    private val gyroZAlpha = 0.25f
+    private val gyroZTurnThreshold = 0.35f
+
     // =================== UDP ===================
     private val matlabIP = "192.168.43.18"
     private val portSend = 30000
@@ -434,6 +509,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var recvThread: Thread? = null
     @Volatile private var receiverRunning = false
     private var lockErrAtStartAbs = 999f
+    @Volatile private var udpMuted = false
+    private var lastUdpErrorMs = 0L
+    private val udpErrorCooldownMs = 5000L
     // =================== ZOOM / PAN ===================
     private val imageMatrixCurrent = Matrix()
     private var matrixReady = false
@@ -506,6 +584,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // ---- Charge l'étalonnage utilisateur (si existant) ----
+        run {
+            val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            stepLenMUser = prefs.getFloat(PREF_STEP_LEN_M, STEP_LEN_M_DEFAULT)
+            stepRefLenMUser = stepLenMUser
+            stepRefPeriodMsUser = prefs.getFloat(PREF_STEP_REF_PERIOD_MS, stepRefPeriodMsUser)
+            stepAmpRefUser = prefs.getFloat(PREF_STEP_AMP_REF, stepAmpRefUser)
+            stepPeriodMs = stepRefPeriodMsUser
+            Log.i(
+                TAG,
+                "Loaded stepLenMUser=%.3f stepRefPeriodMsUser=%.0f"
+                    .format(Locale.US, stepLenMUser, stepRefPeriodMsUser)
+            )
+        }
+
         val root = FrameLayout(this)
         imageView = ImageView(this).apply {
             scaleType = ImageView.ScaleType.MATRIX
@@ -519,7 +612,44 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             )
         )
 
-        val alignButton = Button(this).apply {
+        // -------- Intro Panel (instructions + étalonnage) --------
+        introPanel = FrameLayout(this).apply { setBackgroundColor(Color.rgb(12, 14, 18)) }
+        val scroll = ScrollView(this)
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val pad = (18f * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad, pad, pad)
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+
+        introTitle = TextView(this).apply {
+            text = "Étalonnage de marche (5 m)"
+            setTextColor(Color.WHITE)
+            textSize = 22f
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            gravity = Gravity.CENTER
+        }
+        introBody = TextView(this).apply {
+            setTextColor(Color.argb(230, 220, 230, 245))
+            textSize = 15.5f
+            gravity = Gravity.START
+            text =
+                "Objectif : estimer votre longueur de pas et votre cadence à partir de l’accéléromètre.\n\n" +
+                "Consignes :\n" +
+                "• Allez à la porte d’entrée.\n" +
+                "• Appuyez sur « COMMENCER ».\n" +
+                "• Marchez normalement jusqu’au poteau à côté des panneaux d’affichage (5 m).\n" +
+                "• Arrivé(e) au poteau, appuyez sur « ARRÊT ».\n\n" +
+                "Nous détectons vos pas et calculons automatiquement la longueur de pas."
+        }
+        introStats = TextView(this).apply {
+            setTextColor(Color.argb(230, 190, 240, 200))
+            textSize = 15.5f
+            gravity = Gravity.START
+            text = "Prêt(e) quand vous l’êtes."
+        }
+
+        alignButton = Button(this).apply {
             text = "ALIGN"
             setOnClickListener {
                 val ok = calibrateYawToPath()
@@ -540,7 +670,114 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             topMargin = margin
         }
         root.addView(alignButton, alignParams)
+
+        calibButton = Button(this).apply {
+            text = "START ÉTALONNAGE"
+            setOnClickListener {
+                if (!calibWaitingStart) return@setOnClickListener
+
+                calibWaitingStart = false
+                calibActive = true
+                stepDetectionEnabled = true   // pas actifs UNIQUEMENT apres COMMENCER
+                calibStepCount = 0
+                calibStepTimes.clear()
+                calibStepAmps.clear()
+                calibLastPeakMs = 0L
+                calibPeakArmed = true
+                calibStopButton.visibility = View.VISIBLE
+
+                // IMPORTANT: reset stats pour seuil adaptatif étalonnage (évite pollution)
+                accelWinCount = 0
+                accelWinIdx = 0
+                accelSum = 0f
+                accelSumSq = 0f
+
+                introStats.text =
+                    "Enregistrement en cours…\n" +
+                    "Marchez normalement. Pas détectés : 0"
+
+                Log.i(TAG, "CALIB START")
+            }
+        }
+        calibButton.text = "COMMENCER"
+        calibStopButton = Button(this).apply {
+            text = "FIN ÉTALONNAGE"
+            setOnClickListener {
+                if (!calibActive || calibStepCount < 2) return@setOnClickListener
+                finishCalibrationWithDistance()
+            }
+        }
+        calibStopButton.text = "ARRÊT"
+
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val btnPad = (10f * resources.displayMetrics.density).toInt()
+        btnRow.addView(
+            calibButton,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                rightMargin = btnPad
+            }
+        )
+        btnRow.addView(
+            calibStopButton,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = btnPad
+            }
+        )
+
+        val card = FrameLayout(this).apply {
+            val pad = (16f * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad, pad, pad)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 20f * resources.displayMetrics.density
+                setColor(Color.argb(220, 20, 24, 30))
+                setStroke(
+                    (1f * resources.displayMetrics.density).toInt(),
+                    Color.argb(60, 255, 255, 255)
+                )
+            }
+        }
+        val cardCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        fun spacer(dp: Float): View = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (dp * resources.displayMetrics.density).toInt()
+            )
+        }
+        cardCol.addView(introTitle)
+        cardCol.addView(spacer(10f))
+        cardCol.addView(introBody)
+        cardCol.addView(spacer(14f))
+        cardCol.addView(btnRow)
+        cardCol.addView(spacer(12f))
+        cardCol.addView(introStats)
+        card.addView(cardCol)
+
+        column.addView(
+            card,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        )
+        scroll.addView(column)
+        introPanel.addView(scroll)
+        root.addView(
+            introPanel,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
         setContentView(root)
+
+        imageView.visibility = View.GONE
+        alignButton.visibility = View.GONE
+        calibStopButton.visibility = View.GONE
+        introVisible = true
 
         scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
@@ -557,20 +794,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         })
 
         // Charge plan (modifiable pour doors)
+        val mapOpts = BitmapFactory.Options().apply {
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inMutable = true
+        }
         bmpPlan = BitmapFactory.decodeResource(
             resources,
-            com.example.sensortomatlab.R.drawable.rdc_galilee
-        ).copy(Bitmap.Config.ARGB_8888, true)
+            com.example.sensortomatlab.R.drawable.rdc_galilee,
+            mapOpts
+        )
 
         // Base immuable pour affichage (aprÃ¨s doors)
-        bmpBase = bmpPlan.copy(Bitmap.Config.ARGB_8888, false)
 
         // Overlay rÃ©utilisable
-        bmpOverlay = Bitmap.createBitmap(bmpPlan.width, bmpPlan.height, Bitmap.Config.ARGB_8888)
-        overlayCanvas = Canvas(bmpOverlay)
 
         // Buffer walkable
-        walkable = BooleanArray(bmpPlan.width * bmpPlan.height)
 
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -597,32 +835,45 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Log.e(TAG, "UDP socket error", e)
         }
         udpSendLine("CTRL,PARAM,PXPERM,%.2f" .format(Locale.US,PX_PER_M))
-        udpSendLine("CTRL,PARAM,STEPLEN,%.2f" .format(Locale.US,STEP_LEN_M))
+        udpSendLine("CTRL,PARAM,STEPLEN,%.3f".format(Locale.US, stepLenMUser))
+        udpSendLine("CTRL,PARAM,STEPREFPERIODMS,%.0f".format(Locale.US, stepRefPeriodMsUser))
 
-        imageView.post {
-            Thread {
-                try {
-                    detectAndDilateDoors()
-                    precomputeWalkable()
+        // Préparation carte dès le lancement, mais on n'affiche rien tant que l’étalonnage n’est pas fini.
+                // Pr?paration carte d?s le lancement (pr?charg?e en arri?re-plan)
+        // MAIS affichage uniquement quand l'utilisateur termine l'?talonnage.
+        if (!mapPreloadStarted) {
+            mapPreloadStarted = true
+            root.post {
+                Thread {
+                    try {
+                        detectAndDilateDoors()
+                        walkable = BooleanArray(bmpPlan.width * bmpPlan.height)
+                        precomputeWalkable()
 
-                    // RecrÃ©e bmpBase aprÃ¨s modifications doors
-                    bmpBase = bmpPlan.copy(Bitmap.Config.ARGB_8888, false)
-                    bmpComposed =  Bitmap.createBitmap(bmpBase.width, bmpBase.height ,Bitmap.Config.ARGB_8888)
-                    composedCanvas = Canvas(bmpComposed)
-                    mapReady = true
-                    runOnUiThread {
-                        draw() // premier render
-                        Toast.makeText(this, "Carte prete ", Toast.LENGTH_SHORT).show()
+                        // Pr?pare la base et le canvas compos? apr?s modifications doors
+                        bmpBase = bmpPlan
+                        bmpOverlay = Bitmap.createBitmap(bmpBase.width, bmpBase.height, Bitmap.Config.ARGB_8888)
+                        overlayCanvas = Canvas(bmpOverlay)
+                        mapReady = true
+                        runOnUiThread {
+                            // On ne montre pas tant que l'intro est visible,
+                            // mais si l'intro est déjà fermée => afficher immédiatement.
+                            if (!introVisible) {
+                                imageView.visibility = View.VISIBLE
+                                alignButton.visibility = View.VISIBLE
+                                requestDraw()
+                            }
+                        }
+                        Log.i(TAG, "Map ready: ${bmpPlan.width}x${bmpPlan.height}")
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Map init error", t)
+                        runOnUiThread { Toast.makeText(this, "Erreur init carte", Toast.LENGTH_LONG).show() }
                     }
-                    Log.i(TAG, "Map ready: ${bmpPlan.width}x${bmpPlan.height}")
-                } catch (t: Throwable) {
-                    Log.e(TAG, "Map init error", t)
-                    runOnUiThread { Toast.makeText(this, "Erreur init carte", Toast.LENGTH_LONG).show() }
-                }
-            }.start()
+                }.start()
+            }
         }
 
-        imageView.setOnTouchListener { v, e ->
+imageView.setOnTouchListener { v, e ->
             if (mapReady) {
                 scaleDetector.onTouchEvent(e)
             }
@@ -673,6 +924,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
     private fun getYawSmoothAbsDegOrNull(): Float? {
         return if (yawRawDeg0 > -999f) yawRawDeg0 else null
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // des qu'on quitte l'app => reset total demande
+        resetAppToInitialUI()
     }
 
 
@@ -775,6 +1032,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // steps
         rawStepCount = 0
         sentStepCount = 0
+        stepDetectionEnabled = false
         lastAccelTsNs = 0L
         accelFs = 50f
         accelFilter.reset()
@@ -789,13 +1047,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         lastAccelZf = 0f
         lastAccelMagFilt = 0f
         lastFilt = 0f
+        prevFilt = 0f
         lastDeriv = 0f
         waitingZeroCross = false
         peakTimeMs = 0L
         lastStepTimeMs = 0L
         lastStepAcceptedMs = 0L
         dtStepMs = 0L
-        stepPeriodMs = stepRefPeriodMs
+        // IMPORTANT : repartir sur la référence USER (issue de l'étalonnage)
+        stepPeriodMs = stepRefPeriodMsUser
         accelWinCount = 0
         accelWinIdx = 0
         accelSum = 0f
@@ -870,6 +1130,57 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         udpSendLine("CTRL,RESET")
     }
 
+    // Reset TOTAL quand on quitte l'app (home / app switch)
+    private fun resetAppToInitialUI() {
+        resetNavigationState(keepPoints = false)
+
+        // reset calibration UI/state
+        calibActive = false
+        calibWaitingStart = true
+        calibStepCount = 0
+        calibStepTimes.clear()
+        calibLastPeakMs = 0L
+        calibPeakArmed = true
+
+        introVisible = true
+        runOnUiThread {
+            introPanel.visibility = View.VISIBLE
+            imageView.visibility = View.GONE
+            alignButton.visibility = View.GONE
+            calibStopButton.visibility = View.GONE
+
+            introStats.text = "Pret(e) quand vous l'etes."
+
+            calibButton.visibility = View.VISIBLE
+            calibButton.text = "COMMENCER"
+            calibButton.setOnClickListener {
+                if (!calibWaitingStart) return@setOnClickListener
+
+                calibWaitingStart = false
+                calibActive = true
+                stepDetectionEnabled = true   // pas actifs UNIQUEMENT apres COMMENCER
+
+                calibStepCount = 0
+                calibStepTimes.clear()
+                calibLastPeakMs = 0L
+                calibPeakArmed = true
+                calibStopButton.visibility = View.VISIBLE
+
+                // reset stats pour seuil adaptatif
+                accelWinCount = 0
+                accelWinIdx = 0
+                accelSum = 0f
+                accelSumSq = 0f
+
+                introStats.text =
+                    "Enregistrement en cours...\n" +
+                    "Marchez normalement. Pas detectes : 0"
+
+                Log.i(TAG, "CALIB START")
+            }
+        }
+    }
+
     // =================== PATH ===================
     private fun snapToWalkable(p: PointF, radius: Int = 20): PointF {
         val x0 = p.x.toInt()
@@ -939,7 +1250,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val dy = end.y - start.y
                 val straightDistPx = hypot(dx.toDouble(), dy.toDouble()).toFloat()
                 val distanceM = totalPx / PX_PER_M
-                val steps = max(1, round(distanceM / STEP_LEN_M).toInt())
+                val steps = max(1, round(distanceM / stepLenMUser).toInt())
 
                 // 5) Turn events
                 val turns = computeTurnEventsByDistance(computed, cd)
@@ -975,6 +1286,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 cumDistPx = cd
                 totalDistPx = totalPx
                 totalSteps = steps
+                sentStepCount = 0
+                distAlongPx = 0f
+                distNowPx = 0f
+                ratioNow = 0f
 
                 turnEvents = turns
                 nextTurnIdx = 0
@@ -1070,11 +1385,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
 
             Sensor.TYPE_GYROSCOPE -> {
-                val gx = e.values[0]
-                val gy = e.values[1]
                 val gz = e.values[2]
-                val gmag = sqrt(gx * gx + gy * gy + gz * gz)
-                updateGyroStats(gmag)
+                gyroZFiltered = (1f - gyroZAlpha) * gyroZFiltered + gyroZAlpha * gz
+                lastGyroZ = gyroZFiltered
                 return
             }
 
@@ -1096,9 +1409,52 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val ay = e.values[1]
                 val az = e.values[2]
                 val filtMag = updateAccelFilters(e.timestamp, ax, ay, az)
-                if (!navigationActive) return
+                if (calibActive) {
+                    if (!stepDetectionEnabled) return
+                    val nowMs = e.timestamp / 1_000_000L
+
+                    val amp = abs(filtMag)
+                    val (mu, sd) = updateAccelStats(amp)
+                    // Calibration: marche lente => seuil adaptatif moins agressif.
+                    // On garde ton plancher calibThreshMin (=1.2) mais on baisse K et z.
+                    val k = 0.9f
+                    val zMin = 2.0f
+                    val thresh = max(calibThreshMin, mu + k * sd)
+                    val z = if (sd > 1e-6f) (amp - mu) / sd else 0f
+
+                    val okDelay = nowMs - calibLastPeakMs >= calibMinPeakIntervalMs
+                    val peakOk = (amp >= thresh) && (z >= zMin)
+
+                    if (calibPeakArmed && okDelay && peakOk) {
+                        calibStepCount++
+                        calibStepTimes.add(nowMs)
+                        calibStepAmps.add(amp)
+                        calibPeakArmed = false
+                        calibLastPeakMs = nowMs
+
+                        runOnUiThread {
+                            introStats.text =
+                                "Enregistrement en cours…\nMarchez normalement. Pas détectés : $calibStepCount"
+                        }
+
+                        Log.i(
+                            TAG,
+                            "CALIB STEP $calibStepCount amp=%.2f th=%.2f mu=%.2f sd=%.2f z=%.2f"
+                                .format(Locale.US, amp, thresh, mu, sd, z)
+                        )
+                    } else if (amp < 0.5f * thresh) {
+                        // ré-armement quand on retombe bien en dessous
+                        calibPeakArmed = true
+                    }
+                    return
+                }
+                // navigation: pas detectes seulement si on est en RUNNING
+                if (!(navigationActive && navState == NavState.RUNNING)) return
+                if (!stepDetectionEnabled) return
 
                 if (detectStepFromAccel(filtMag, e.timestamp)) {
+                    val nowMs = e.timestamp / 1_000_000L
+
                     rawStepCount++
 
                     if (navState == NavState.READY) {
@@ -1173,13 +1529,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         }
 
                         sentStepCount++
-                        distAlongPx = min(totalDistPx, distAlongPx + STEP_LEN_PX)
+                        val stepPx = stepLenPxDynNow()
+                        distAlongPx = min(totalDistPx, distAlongPx + stepPx)
+                        udpSendLine(
+                            "CTRL,STEPINFO,STEPLENM,%.3f,CAD,%.0f"
+                                .format(Locale.US, stepLenMdynNow(), cadenceSpmNow())
+                        )
                         val nowMs = System.currentTimeMillis()
                         udpSendLine("STEP_EVT,$sentStepCount,$nowMs")
                         updatePositionFromAlongDistance()
                         Log.i(
                             TAG,
-                            "STEP stepPx=$STEP_LEN_PX distAlongPx=$distAlongPx distNowPx=$distNowPx total=$totalDistPx"
+                            "STEP stepPx=%.2f stepLenM=%.3f T=%.0fms cad=%.0fspm distAlongPx=%.1f"
+                                .format(
+                                    Locale.US,
+                                    stepPx,
+                                    stepLenMdynNow(),
+                                    stepPeriodMs,
+                                    cadenceSpmNow(),
+                                    distAlongPx
+                                )
                         )
 
                         udpSendLine("STEP,$sentStepCount")
@@ -1205,8 +1574,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (totalDistPx <= 0f) return
 
         val yawRel = getYawFiltered()
-        pushYawSample(yawRel)
-        val yawVar = computeYawVariance()
+        val yawVar = 0f
 
         val maxSeg = path.size - 2
         if (maxSeg < 0) return
@@ -1222,15 +1590,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
 
         val segRel = absToRelMap(segAbs)
-        val errSeg = angleErrorDeg(segRel, yawRel)
 
         udpSendLine(
-            "DBG,YAW,yawRel=%.1f,segRel=%.1f,err=%.1f,dist=%.1f,ratio=%.3f,seg=%d,lock=%b,dir=%s,state=%s,src=%s,mag=%b,gyroVar=%.3f,drx=%.1f,dry=%.1f,proj=%.1f,lambda=%.2f"
+            "DBG,YAW,yawRel=%.1f,segRel=%.1f,dist=%.1f,ratio=%.3f,seg=%d,lock=%b,dir=%s,state=%s,src=%s,mag=%b,drx=%.1f,dry=%.1f"
                 .format(
                     Locale.US,
                     yawRel,
                     segRel,
-                    errSeg,
                     distNowPx,
                     ratioNow,
                     segIdx,
@@ -1239,11 +1605,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     navState.name,
                     lastYawSource,
                     magDisturbed,
-                    gyroVar,
                     drPosPx.x,
-                    drPosPx.y,
-                    lastProjDistPx,
-                    lastMapMatchLambda
+                    drPosPx.y
                 )
         )
 
@@ -1252,12 +1615,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             lastDbgTime = now
             Log.d(
                 TAG,
-                "DBG trig=$trigger seg=$segIdx dist=%.1fpx ratio=%.3f step=$sentStepCount yawRel=%.1f segRel=%.1f err=%.1f lock=$turnLockActive($turnLockDir) okCount=$lockOkCount"
-                    .format(Locale.US, distNowPx, ratioNow, yawRel, segRel, errSeg, turnLockDir)
+                "DBG trig=$trigger seg=$segIdx dist=%.1fpx ratio=%.3f step=$sentStepCount yawRel=%.1f segRel=%.1f lock=$turnLockActive($turnLockDir)"
+                    .format(Locale.US, distNowPx, ratioNow, yawRel, segRel, turnLockDir)
             )
         }
         val turnState = if (turnLockActive) "LOCK_$turnLockDir" else "OK"
-        logCsvLine(yawRel, yawVar, gyroVar, drPosPx, distNowPx, segIdx, turnState)
+        logCsvLine(yawRel, yawVar, 0f, drPosPx, distNowPx, segIdx, turnState)
         val nextInfo = getNextTurnInfo()
         if (nextInfo == null) {
             lastTurnHintIdx = -1
@@ -1287,90 +1650,67 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         // 1) dÃ©clenchement lock virage par distance
         val turns = turnEvents
-        if (!turnLockActive && nextTurnIdx < turns.size && sentStepCount >= minStepsBeforeFirstLock) {
+        if (!turnLockActive && nextTurnIdx < turns.size) {
             val ev = turns[nextTurnIdx]
-            if (distNowPx >= (ev.atDistPx - lookAheadPx)) {
+            if (distNowPx >= ev.atDistPx - lookAheadPx) {
                 turnLockActive = true
                 turnLockDir = ev.dir
-                turnLockTargetAbs = ev.newHeadingAbs
-                lockOkCount = 0
-                turnGyroSeen = false
+                pendingStepsWhileLocked = 0
 
-                val targetRel = absToRelMap(turnLockTargetAbs)
-                lockErrAtStartAbs = abs(angleErrorDeg(targetRel, yawRel))
-                lockOkCount = 0
-                Log.i(TAG, "LOCK ON dir=$turnLockDir atDist=%.1f targetAbs=%.1f targetRel=%.1f yawRel=%.1f"
-                    .format(Locale.US, ev.atDistPx, turnLockTargetAbs, targetRel, yawRel))
-
-                udpSendLine("TURN,$turnLockDir")
+                udpSendLine("TURN,${ev.dir}")
                 vibrate(250)
+
+                Log.i(TAG, "TURN LOCK ON dir=${ev.dir}")
             }
         }
 
-        // 2) lock actif
+        // 2) validation par gyro Z
         if (turnLockActive) {
-            val targetRel = absToRelMap(turnLockTargetAbs)
-            val err = angleErrorDeg(targetRel, yawRel)
-            if (gyroVar >= turnGyroVarMin) {
-                turnGyroSeen = true
-            }
-// si au moment oÃ¹ on a lockÃ©, on Ã©tait dÃ©jÃ  presque bon, on ne valide pas ce lock
-            if (lockErrAtStartAbs < lockMinErrToRequireTurn) {
-                // on continue dâ€™indiquer le virage mais on ne pourra pas faire OFF tout de suite
-                // option 1: on annule le lock carrÃ©ment
-                turnLockActive = false
-                turnGyroSeen = false
-                udpSendLine("TURN,OK")
-                Log.i(TAG, "LOC CANCEL (too close at start) errStart=%.1f".format(Locale.US, lockErrAtStartAbs))
-                return
-            }
-            if (!turnGyroSeen) {
-                lockOkCount = 0
-            } else if (abs(err) <= TURN_END) {
-                lockOkCount++
-            } else if (abs(err) <= TURN_END + 6f) {
-                // petite sortie de zone: on dÃ©crÃ©mente au lieu de reset
-                lockOkCount = max(0, lockOkCount - 1)
-            } else {
-                lockOkCount = 0
-            }
-
-            Log.i(TAG, "LOCKCHK err=%.1f okCount=$lockOkCount need=$lockOkNeeded".format(Locale.US, err))
-
-            if (lockOkCount >= lockOkNeeded) {
-                turnLockActive = false
-                nextTurnIdx++
-                lockOkCount = 0
-                turnGyroSeen = false
-                // On applique les pas accumulÃ©s pendant le virage
-                if (pendingStepsWhileLocked > 0) {
-                    applyPendingSteps()
-
-
-                    udpSendLine("STEP,$sentStepCount")
-                    draw()
+            when (turnLockDir) {
+                "RIGHT" -> {
+                    if (lastGyroZ < -gyroZTurnThreshold) {
+                        validateTurn()
+                        return
+                    } else {
+                        udpSendLine("TURN,RIGHT")
+                    }
                 }
-
-                udpSendLine("TURN,OK")
-                Log.i(TAG, "LOCK OFF OK (stable) yawRel=%.1f targetRel=%.1f nextTurnIdx=$nextTurnIdx"
-                    .format(Locale.US, yawRel, targetRel))
-                vibrate(120)
-            } else {
-                udpSendLine("TURN,$turnLockDir")
+                "LEFT" -> {
+                    if (lastGyroZ > gyroZTurnThreshold) {
+                        validateTurn()
+                        return
+                    } else {
+                        udpSendLine("TURN,LEFT")
+                    }
+                }
             }
+            return
         } else {
-            // 3) corrections hors lock
-            var diff = errSeg
-            if (abs(diff) < deadZone) diff = 0f
-            else if (abs(diff) < correctionThreshold) diff *= 0.5f
-
-            if (diff > TURN_START) udpSendLine("TURN,RIGHT")
-            else if (diff < -TURN_START) udpSendLine("TURN,LEFT")
-            else udpSendLine("TURN,OK")
+            udpSendLine("TURN,OK")
         }
 
         // fin
         if (ratioNow >= 0.995f) navCompleted()
+    }
+
+    private fun validateTurn() {
+        turnLockActive = false
+        nextTurnIdx++
+
+        if (pendingStepsWhileLocked > 0) {
+            applyPendingSteps()
+            udpSendLine("STEP,$sentStepCount")
+            draw()
+        }
+
+        udpSendLine("TURN,OK")
+        vibrate(120)
+
+        Log.i(
+            TAG,
+            "TURN VALIDATED by gyroZ = %.3f"
+                .format(Locale.US, lastGyroZ)
+        )
     }
 
     private fun navCompleted() {
@@ -1509,75 +1849,213 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return filtMag
     }
 
+
     private fun detectStepFromAccel(filt: Float, tsNs: Long): Boolean {
         val nowMs = tsNs / 1_000_000L
-        val dynMinDelayMs = max(minStepDelay.toFloat(), minDelayFrac * stepPeriodMs).toLong()
-        val dynZeroCrossTimeoutMs = max(stepZeroCrossTimeoutMs.toFloat(), zeroCrossFrac * stepPeriodMs).toLong()
-        val absFilt = abs(filt)
-        val (meanAbs, stdAbs) = updateAccelStats(absFilt)
-        val thresh = meanAbs + stepThreshK * stdAbs
 
-        val deriv = filt - lastFilt
-        val lastAbs = abs(lastFilt)
-        val z = if (stdAbs > 1e-6f) (lastAbs - meanAbs) / stdAbs else 0f
-        val prominenceOk = (lastAbs - meanAbs) >= stepProminenceMin
-        val zOk = z >= stepZScoreMin
-        var stepDetected = false
+        // Refractory dynamique (cadence)
+        val dynMinDelayMs = max(minStepDelay.toFloat(), minDelayFrac * stepPeriodMs).toLong()
+
+        val absCurr = abs(filt)
+        val absLast = abs(lastFilt)
+        val absPrev = abs(prevFilt)
 
         if (accelWinCount < 10) {
-            lastDeriv = deriv
+            prevFilt = lastFilt
             lastFilt = filt
+            peakAbsHold = max(peakAbsHold, absCurr)
             return false
         }
 
-        if (!waitingZeroCross) {
+        // --- Stats robustes (et IMPORTANT: on "gele" un peu pendant les pics) ---
+        // Si on est clairement sur un gros pic, on evite d'alimenter la moyenne avec ca.
+        val feed = min(absCurr, max(0.25f, 0.70f * peakAbsHold.coerceAtLeast(absCurr)))
+        val (meanAbs, stdAbs) = updateAccelStatsRobust(feed)
 
-            val peakOk = abs(lastFilt) > thresh && (prominenceOk || zOk)
-            val sinceLast = nowMs - lastStepAcceptedMs
-            if (lastDeriv > 0f && deriv <= 0f && peakOk && sinceLast > dynMinDelayMs) {
-                waitingZeroCross = true
-                peakTimeMs = nowMs
-                // debbug pour les pas perdu
+        // Seuil adaptatif leger + plancher (petits pas)
+        val threshFloor = 0.08f
+        val thresh = max(threshFloor, meanAbs + stepThreshK * stdAbs)
+
+        // Prominence legere (si bruit faible)
+        val prominenceOk = (absLast - meanAbs) >= stepProminenceMin
+
+        // Detection de pic LOCAL sur |signal| (pas besoin de zero-cross)
+        val localMaxAbs = (absLast >= absPrev && absLast >= absCurr)
+
+        val sinceLast = nowMs - lastStepAcceptedMs
+        if (localMaxAbs && sinceLast > dynMinDelayMs && (absLast > thresh || prominenceOk)) {
+
+            // update periode
+            if (lastStepAcceptedMs != 0L) {
+                dtStepMs = nowMs - lastStepAcceptedMs
+                val dt = dtStepMs.toFloat()
+                val dtClamped = dt.coerceIn(stepPeriodMinMs, stepPeriodMaxMs)
+                stepPeriodMs = (1f - stepPeriodAlpha) * stepPeriodMs + stepPeriodAlpha * dtClamped
+            }
+
+            lastStepAcceptedMs = nowMs
+            lastStepTimeMs = nowMs
+
+            // memorise amplitude pour limiter la stats update plus haut
+            peakAbsHold = absLast
+
+            lastStepAmpAbs = absLast.coerceAtLeast(0.05f)
+            if (DBG) {
                 udpSendLine(
-                    "DBGSTEP,PEAK,f=%.4f,th=%.4f,mu=%.4f,sd=%.4f,z=%.2f,prom=%b,T=%.0f,dt=%d,min=%d"
-                        .format(Locale.US, lastFilt, thresh, meanAbs, stdAbs, z, prominenceOk, stepPeriodMs, sinceLast, dynMinDelayMs)
+                    "DBGSTEP,STEP,abs=%.4f,th=%.4f,mu=%.4f,sd=%.4f,T=%.0f,dt=%d,min=%d"
+                        .format(Locale.US, absLast, thresh, meanAbs, stdAbs, stepPeriodMs, sinceLast, dynMinDelayMs)
                 )
             }
+            return true
+        }
+
+        // update memoire
+        prevFilt = lastFilt
+        lastFilt = filt
+        return false
+    }
+
+    private fun finishCalibrationWithDistance() {
+        calibActive = false
+        calibWaitingStart = false
+        stepDetectionEnabled = false  // stop pas des qu'on finit l'etalonnage
+
+        if (calibStepCount <= 0) return
+
+        if (calibStepCount !in 5..12) {
+            Toast.makeText(
+                this,
+                "Étalonnage invalide ($calibStepCount pas détectés).\nRefaites la marche de 5 m.",
+                Toast.LENGTH_LONG
+            ).show()
+            Log.w(TAG, "CALIB REJECT steps=$calibStepCount")
+            calibWaitingStart = true
+            calibButton.visibility = View.VISIBLE
+            calibStopButton.visibility = View.GONE
+            runOnUiThread {
+                introStats.text =
+                    "Résultat incohérent (pas détectés : $calibStepCount).\n" +
+                    "Astuce : marchez normalement, téléphone stable, puis réessayez."
+            }
+            return
+        }
+
+        val intervals = ArrayList<Float>(max(0, calibStepTimes.size - 1))
+        for (i in 1 until calibStepTimes.size) {
+            intervals.add((calibStepTimes[i] - calibStepTimes[i - 1]).toFloat())
+        }
+        val dtRefRaw = if (intervals.isNotEmpty()) {
+            val sorted = intervals.sorted()
+            sorted[sorted.size / 2].coerceIn(stepPeriodMinMs, stepPeriodMaxMs)
         } else {
-            val eps = 0.01f
-            if (abs(filt) <= eps ||(lastFilt>0 && filt <0)||(lastFilt < 0 && filt > 0)) {
+            stepRefPeriodMs
+        }
+        val minOk = dtRefRaw * 0.55f
+        val maxOk = dtRefRaw * 1.70f
+        val intervalsOk = intervals.filter { it in minOk..maxOk }
+        val dtRef = if (intervalsOk.isNotEmpty()) {
+            val sorted = intervalsOk.sorted()
+            sorted[sorted.size / 2].coerceIn(stepPeriodMinMs, stepPeriodMaxMs)
+        } else {
+            dtRefRaw
+        }
+        if (dtRef > calibMaxRefPeriodMs) {
+            Toast.makeText(
+                this,
+                "Etalonnage invalide (pauses ou marche trop lente).\nRefaites les 5 m d'un seul trait.",
+                Toast.LENGTH_LONG
+            ).show()
+            Log.w(TAG, "CALIB REJECT dtRef=%.0fms".format(Locale.US, dtRef))
+            calibWaitingStart = true
+            calibButton.visibility = View.VISIBLE
+            calibStopButton.visibility = View.GONE
+            runOnUiThread {
+                introStats.text =
+                    "Resultat incoherent (pauses detectees).\n" +
+                    "Astuce : marchez d'un seul trait, sans vous arreter."
+            }
+            return
+        }
 
-                val gyroOk = gyroWinCount == 0 || gyroVar >= minGyroVar
-                val sinceLast = nowMs - lastStepAcceptedMs
-                if (gyroOk && sinceLast > dynMinDelayMs) {
-                    stepDetected = true
+        // amplitude ref = mediane (robuste)
+        val amps = calibStepAmps.sorted()
+        val ampRef = if (amps.isNotEmpty()) {
+            amps[amps.size / 2].coerceAtLeast(0.05f)
+        } else {
+            0.12f
+        }
+        stepAmpRefUser = ampRef
 
-                    if (lastStepAcceptedMs != 0L) {
-                        dtStepMs = nowMs - lastStepAcceptedMs
-                        val dtClamped = dtStepMs.toFloat().coerceIn(stepPeriodMinMs, stepPeriodMaxMs)
-                        stepPeriodMs = (1f - stepPeriodAlpha) * stepPeriodMs + stepPeriodAlpha * dtClamped
-                    }
+        var weightSum = 0f
+        for (i in 0 until calibStepTimes.size) {
+            val dt = if (i == 0) dtRef else (calibStepTimes[i] - calibStepTimes[i - 1]).toFloat()
+            val dtUse = if (dt in minOk..maxOk) dt else dtRef
+            val dtClamped = dtUse.coerceIn(stepPeriodMinMs, stepPeriodMaxMs)
+            val ratioT = (dtRef / dtClamped).coerceIn(0.6f, 1.6f)
+            val cadFactor = ratioT.toDouble().pow(0.20).toFloat()
+            val ampRatio = (calibStepAmps[i] / ampRef).coerceIn(0.6f, 1.6f)
+            val ampFactor = ampRatio.toDouble().pow(0.25).toFloat()
+            weightSum += (cadFactor * ampFactor)
+        }
+        val stepLenUser = if (weightSum > 0f) {
+            (CALIB_DISTANCE_M / weightSum)
+        } else {
+            (CALIB_DISTANCE_M / calibStepCount.toFloat())
+        }.coerceIn(stepLenMinM, stepLenMaxM)
 
-                    lastStepAcceptedMs = nowMs
-                    lastStepTimeMs = nowMs
-                    if (DBG) {
-                        Log.w(
-                            TAG,
-                            "STEP OK dt=%dms T=%.0fms min=%dms zt=%dms"
-                                .format(Locale.US, sinceLast, stepPeriodMs, dynMinDelayMs, dynZeroCrossTimeoutMs)
-                        )
-                    }
-                }
-                waitingZeroCross = false
-            } else if (nowMs - peakTimeMs > dynZeroCrossTimeoutMs) {
-                udpSendLine("DBGSTEP,TIMEOUT,f=%.4f,T=%.0f,zt=%d".format(Locale.US, filt, stepPeriodMs, dynZeroCrossTimeoutMs))
-                waitingZeroCross = false
+        stepLenMUser = stepLenUser
+        stepRefLenMUser = stepLenUser
+        stepRefPeriodMsUser = dtRef
+        stepPeriodMs = dtRef
+
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putFloat(PREF_STEP_LEN_M, stepLenMUser)
+            .putFloat(PREF_STEP_REF_PERIOD_MS, stepRefPeriodMsUser)
+            .putFloat(PREF_STEP_AMP_REF, stepAmpRefUser)
+            .apply()
+
+        udpSendLine("CTRL,PARAM,STEPLEN,%.3f".format(Locale.US, stepLenMUser))
+        udpSendLine("CTRL,PARAM,STEPREFPERIODMS,%.0f".format(Locale.US, stepRefPeriodMsUser))
+
+        val cadenceSpm = (60000f / stepRefPeriodMsUser).coerceIn(40f, 220f)
+        val vibe = when {
+            cadenceSpm < 95f -> "Mode balade "
+            cadenceSpm < 125f -> "Marche efficace "
+            cadenceSpm < 155f -> "Rythme tonique"
+            else -> "Turbo marche "
+        }
+        runOnUiThread {
+            introStats.text =
+                "Mesures terminées ✅\n\n" +
+                "• Pas détectés : $calibStepCount\n" +
+                "• Longueur de pas : %.2f m\n".format(Locale.US, stepLenMUser) +
+                "• Cadence : %.0f pas/min\n".format(Locale.US, cadenceSpm) +
+                "• Qualité : $vibe\n\n" +
+                "Vous pouvez commencer la navigation."
+        }
+
+        calibStopButton.visibility = View.GONE
+        calibButton.visibility = View.VISIBLE
+        calibButton.text = "COMMENCER NAVIGATION"
+        calibButton.setOnClickListener {
+            introVisible = false
+            introPanel.visibility = View.GONE
+            imageView.visibility = View.VISIBLE
+            alignButton.visibility = View.VISIBLE
+            // On n'active pas les pas ici: ils s'activeront quand la nav passe RUNNING
+            stepDetectionEnabled = true
+            if (mapReady) {
+                requestDraw()
+            } else {
+                Toast.makeText(this, "Préparation de la carte…", Toast.LENGTH_SHORT).show()
             }
         }
 
-        lastDeriv = deriv
-        lastFilt = filt
-        return stepDetected
+        Log.i(
+            TAG,
+            "CALIB DONE dist=5m steps=$calibStepCount stepLen=%.3f T=%.0fms"
+                .format(Locale.US, stepLenMUser, stepRefPeriodMsUser)
+        )
     }
 
     private fun updateAccelStats(valueAbs: Float): Pair<Float, Float> {
@@ -1590,6 +2068,36 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         val mean = if (accelWinCount > 0) accelSum / accelWinCount else 0f
         val varAbs = if (accelWinCount > 0) accelSumSq / accelWinCount - mean * mean else 0f
+        val std = sqrt(max(0f, varAbs))
+        return mean to std
+    }
+
+    private fun updateAccelStatsRobust(valueAbs: Float): Pair<Float, Float> {
+        // Stats before update
+        val meanOld = if (accelWinCount > 0) accelSum / accelWinCount else 0f
+        val varOld = if (accelWinCount > 0) accelSumSq / accelWinCount - meanOld * meanOld else 0f
+        val stdOld = sqrt(max(0f, varOld))
+
+        // Clipping: avoid peaks pulling mean/std up too much
+        val cap = if (accelWinCount < 20) {
+            // Early window: avoid cap too low
+            max(0.30f, meanOld + 4.0f * stdOld)
+        } else {
+            max(0.30f, meanOld + 2.5f * stdOld)
+        }
+
+        val clipped = valueAbs.coerceAtMost(cap)
+
+        // Update window with clipped value
+        val old = if (accelWinCount < accelStatsWindow) 0f else accelWin[accelWinIdx]
+        if (accelWinCount < accelStatsWindow) accelWinCount++
+        accelSum += clipped - old
+        accelSumSq += clipped * clipped - old * old
+        accelWin[accelWinIdx] = clipped
+        accelWinIdx = (accelWinIdx + 1) % accelStatsWindow
+
+        val mean = accelSum / accelWinCount
+        val varAbs = accelSumSq / accelWinCount - mean * mean
         val std = sqrt(max(0f, varAbs))
         return mean to std
     }
@@ -1652,8 +2160,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             drPosPx = PointF(s.x, s.y)
             drHasPos = true
         }
-        val ratio = (stepRefPeriodMs / stepPeriodMs).toDouble()
-        val stepLenMdyn = (stepRefLenM * ratio.pow(stepLenAlpha.toDouble())).toFloat()
+        val ratio = (stepRefPeriodMsUser / stepPeriodMs).toDouble()
+        val stepLenMdyn = (stepRefLenMUser * ratio.pow(stepLenAlpha.toDouble())).toFloat()
             .coerceIn(stepLenMinM, stepLenMaxM)
         val stepPx = (PX_PER_M * stepLenMdyn) * steps
         val rad = Math.toRadians(yawRel.toDouble())
@@ -1694,10 +2202,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun applyPendingSteps() {
         if (pendingStepsWhileLocked <= 0) return
         sentStepCount += pendingStepsWhileLocked
-        distAlongPx = min(
-            totalDistPx,
-            distAlongPx + STEP_LEN_PX * pendingStepsWhileLocked
-        )
+        val stepPx = stepLenPxDynNow()
+        distAlongPx = min(totalDistPx, distAlongPx + stepPx * pendingStepsWhileLocked)
         updatePositionFromAlongDistance()
         pendingStepsWhileLocked = 0
     }
@@ -1910,6 +2416,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (navState == NavState.RUNNING) {
             lines.add("Pas: $sentStepCount/$totalSteps")
             lines.add("Yaw: %.0f deg".format(Locale.US, yawFiltered))
+            lines.add("Cadence: %.0f spm".format(Locale.US, cadenceSpmNow()))
+            lines.add("Pas: %.2f m".format(Locale.US, stepLenMdynNow()))
             val info = getNextTurnInfo()
             if (info != null) {
                 val distM = info.distM.coerceAtLeast(0f)
@@ -1933,6 +2441,50 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val y = 12f
         val rect = RectF(x, y, x + maxW + pad * 2, y + lineH * lines.size + pad * 2)
         c.drawRoundRect(rect, 10f, 10f, paintUiBg)
+        var ty = y + pad + paintUiText.textSize
+        for (s in lines) {
+            c.drawText(s, x + pad, ty, paintUiText)
+            ty += lineH
+        }
+    }
+    private fun drawProgressOverlay(c: Canvas) {
+        if (!navigationActive) return
+        if (navState == NavState.IDLE) return
+
+        val distTotalM = totalDistPx / PX_PER_M
+        val distNowM = distNowPx / PX_PER_M
+
+        val stepsDone = sentStepCount
+        val stepsTotal = totalSteps
+        val stepsLeft = (stepsTotal - stepsDone).coerceAtLeast(0)
+
+        val lines = listOf(
+            "Distance : %.1f m".format(Locale.US, distTotalM),
+            "Pas totaux : $stepsTotal",
+            "Effectues : $stepsDone",
+            "Restants : $stepsLeft"
+        )
+
+        val pad = 12f
+        val lineH = paintUiText.textSize + 6f
+
+        var maxW = 0f
+        for (s in lines) {
+            maxW = max(maxW, paintUiText.measureText(s))
+        }
+
+        val x = 12f
+        val y = bmpPlan.height - (lines.size * lineH + pad * 2) - 12f
+
+        val rect = RectF(
+            x,
+            y,
+            x + maxW + pad * 2,
+            y + lines.size * lineH + pad * 2
+        )
+
+        c.drawRoundRect(rect, 14f, 14f, paintUiBg)
+
         var ty = y + pad + paintUiText.textSize
         for (s in lines) {
             c.drawText(s, x + pad, ty, paintUiText)
@@ -2001,7 +2553,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // anti-virages collÃ©s: min 2 pas
         val filtered = mutableListOf<TurnEvent>()
         var lastDist = -1e9f
-        val minGap = 2f * STEP_LEN_PX
+        val minGap = 2f * (PX_PER_M * stepRefLenMUser)
         for (ev in out) {
             if (ev.atDistPx - lastDist >= minGap) {
                 filtered.add(ev)
@@ -2042,8 +2594,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val data = s.toByteArray()
                 val p = DatagramPacket(data, data.size, InetAddress.getByName(matlabIP), portSend)
                 sock.send(p)
+            } catch (_: IOException) {
+                // Reseau down / unreachable / pas de route : on ignore (pas de spam log)
+            } catch (_: SecurityException) {
+                // Cas rare: permission reseau / policy : on ignore aussi pour eviter le spam
             } catch (t: Throwable) {
-                Log.e(TAG, "udpSendLine error: $line", t)
+                // Vrais bugs (ex: crash inattendu) -> on garde un log
+                Log.e(TAG, "udpSendLine unexpected error", t)
             }
         }
     }
@@ -2057,8 +2614,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val data = payload.toByteArray()
                 val p = DatagramPacket(data, data.size, InetAddress.getByName(matlabIP), portSend)
                 sock.send(p)
+            } catch (_: IOException) {
+                // Reseau down / unreachable : on ignore (pas de spam log)
+            } catch (_: SecurityException) {
+                // Pareil
             } catch (t: Throwable) {
-                Log.e(TAG, "udpSendBatch error", t)
+                Log.e(TAG, "udpSendBatch unexpected error", t)
             }
         }
     }
@@ -2132,7 +2693,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         udpSendLine(sb.toString())
         udpSendLine("CTRL,PARAM,PXPERM,%.2f".format(Locale.US, PX_PER_M))
-        udpSendLine("CTRL,PARAM,STEPLEN,%.2f".format(Locale.US, STEP_LEN_M))
+        udpSendLine("CTRL,PARAM,STEPLEN,%.3f".format(Locale.US, stepLenMUser))
         udpSendLine("CTRL,PARAM,HEADING0ABS,%.1f".format(Locale.US, heading0Abs))
         udpSendLine("CTRL,PARAM,TOTALSTEPS,$totalSteps")
 
@@ -2305,6 +2866,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         // Clear overlay
         overlayCanvas.drawRect(0f, 0f, bmpOverlay.width.toFloat(), bmpOverlay.height.toFloat(), paintClear)
+        overlayCanvas.drawBitmap(bmpBase, 0f, 0f, null)
 
         // points
         val end = endPoint
@@ -2357,9 +2919,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (drHasPos) {
             drawUserArrow(overlayCanvas, drPosPx, yawFiltered)
         }
-    composedCanvas.drawBitmap(bmpBase,0f,0f,null)
-        composedCanvas.drawBitmap(bmpOverlay,0f,0f, null )
-        imageView.setImageBitmap(bmpComposed)
+        drawStatusOverlay(overlayCanvas)
+        drawHeadingCompass(overlayCanvas)
+        drawProgressOverlay(overlayCanvas)
+        imageView.setImageBitmap(bmpOverlay)
         imageView.imageMatrix = imageMatrixCurrent
     }
 
@@ -2389,10 +2952,34 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         doorMask.clear()
         val w = bmpPlan.width
         val h = bmpPlan.height
+
+        // BLUE thresholds
+        val BLUE_H_MIN = 200f
+        val BLUE_H_MAX = 240f
+
+        // ORANGE thresholds (#EE771D)
+        val ORANGE_H_MIN = 12f
+        val ORANGE_H_MAX = 55f
+
+        // Same S/V thresholds as blue (slightly tolerant)
+        val S_MIN = 0.25f
+        val V_MIN = 0.18f
+
         for (y in 0 until h step 2) for (x in 0 until w step 2) {
             val hsv = FloatArray(3)
             Color.colorToHSV(bmpPlan.getPixel(x, y), hsv)
-            if (hsv[0] in 200f..240f && hsv[1] > 0.3f && hsv[2] > 0.2f) {
+
+            val isBlue =
+                (hsv[0] in BLUE_H_MIN..BLUE_H_MAX) &&
+                (hsv[1] > S_MIN) &&
+                (hsv[2] > V_MIN)
+
+            val isOrange =
+                (hsv[0] in ORANGE_H_MIN..ORANGE_H_MAX) &&
+                (hsv[1] > S_MIN) &&
+                (hsv[2] > V_MIN)
+
+            if (isBlue || isOrange) {
                 for (dx in -3..3) for (dy in -3..3) {
                     val nx = (x + dx).coerceIn(0, w - 1)
                     val ny = (y + dy).coerceIn(0, h - 1)
