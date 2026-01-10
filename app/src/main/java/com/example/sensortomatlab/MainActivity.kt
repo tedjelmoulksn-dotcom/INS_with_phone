@@ -4,6 +4,7 @@ import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.hardware.*
 import android.os.*
+import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -35,7 +36,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     @Volatile private var stepDetectionEnabled = false
 
     // =================== USER PARAMS ===================
-    private val PX_PER_M = 31.06f       // calibration px/m
+    private val PX_PER_M = 30f       // calibration px/m 31.06
     private val STEP_LEN_M = 0.65f     // longueur de pas moyenne
     // STEP_LEN_PX supprimé : on utilise toujours stepLenPxNow() (basé sur l'étalonnage user)
     private fun stepLenPxNow(): Float = PX_PER_M * stepLenMUser
@@ -50,6 +51,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return stepLen.toFloat().coerceIn(stepLenMinM, stepLenMaxM)
     }
     private fun stepLenPxDynNow(): Float = PX_PER_M * stepLenMdynNow()
+    private fun stepLenPxNav(): Float = PX_PER_M * stepLenNavM
     private fun cadenceSpmNow(): Float = (60000f / stepPeriodMs).coerceIn(40f, 260f)
     private fun cadenceSpmInstant(): Float =
         if (dtStepMs > 0) (60000f / dtStepMs.toFloat()).coerceIn(40f, 260f) else cadenceSpmNow()
@@ -148,11 +150,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var alignButton: Button
     private lateinit var calibButton: Button
     private lateinit var calibStopButton: Button
+    private lateinit var navControls: LinearLayout
+    private lateinit var pickStartButton: Button
+    private lateinit var confirmStartButton: Button
+    private lateinit var pickEndButton: Button
+    private lateinit var confirmEndButton: Button
+    private lateinit var restartButton: Button
+    private lateinit var navHintText: TextView
     private lateinit var introPanel: FrameLayout
     private lateinit var introTitle: TextView
     private lateinit var introBody: TextView
     private lateinit var introStats: TextView
     private var introVisible = true
+
+    private enum class SelectMode { NONE, PICK_START, PICK_END }
+    private var selectMode = SelectMode.NONE
+    private var startConfirmed = false
+    private var endConfirmed = false
 
     private lateinit var vibrator: Vibrator
 
@@ -207,9 +221,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val stepBandLowHz = 0.25f
     private val stepBandHighHz = 3.0f
     // Un peu moins agressif pour ne pas rater les pas lents
-    private val stepThreshK = 0.14f          // plus sensible
-    private val stepProminenceMin = 0.045f   // petits pas
-    private val minStepDelay = 160           // evite double comptage (marche normale)
+    private val stepThreshK = 0.18f          // un peu moins sensible
+    private val stepProminenceMin = 0.055f   // petits pas
+    private val minStepDelay = 360           // evite double comptage (marche normale)
     private val accelStatsWindow = 120
     private val gyroStatsWindow = 40
     private val minGyroVar = 0.02f
@@ -248,14 +262,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val calibStepTimes = ArrayList<Long>(64)
     private var calibLastPeakMs = 0L
     private var calibPeakArmed = true
-    private val calibStepThreshK = 1.2f
-    private val calibStepZMin = 2.5f
-    private val calibThreshMin = 1.2f          // post-filtrage
-    private val calibMinPeakIntervalMs = 400L
+    private val calibStepThreshK = 0.55f
+    private val calibStepZMin = 0.9f
+    private val calibThreshMin = 0.40f         // post-filtrage
+    private val calibMinStd = 0.07f
+    private val calibMinPeakIntervalMs = 380L
     private val calibMaxRefPeriodMs = 1600f
     private var stepRefPeriodMsUser = 550f
     private var stepRefLenMUser = STEP_LEN_M
     private var stepLenMUser = STEP_LEN_M
+    private var stepLenNavM = STEP_LEN_M
     private val PREFS_NAME = "calibration_prefs"
     private val PREF_STEP_LEN_M = "pref_step_len_m"
     private val PREF_STEP_REF_PERIOD_MS = "pref_step_ref_period_ms"
@@ -517,6 +533,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var matrixReady = false
     private var lastTouchX = 0f
     private var lastTouchY = 0f
+    private var lastFocusX = 0f
+    private var lastFocusY = 0f
+    private var hasFocus = false
     private var isPanning = false
     private var isScaling = false
     private val touchSlop by lazy { ViewConfiguration.get(this).scaledTouchSlop }
@@ -671,6 +690,153 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         root.addView(alignButton, alignParams)
 
+        navControls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.END
+            val pad = (4f * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad, pad, pad)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 10f * resources.displayMetrics.density
+                setColor(Color.argb(180, 20, 24, 30))
+                setStroke(
+                    (1f * resources.displayMetrics.density).toInt(),
+                    Color.argb(60, 255, 255, 255)
+                )
+            }
+        }
+        navHintText = TextView(this).apply {
+            setTextColor(Color.argb(230, 220, 230, 245))
+            textSize = 9.5f
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            text = "1) Choisir start\n2) Valider start\n3) Choisir arrivee\n4) Valider arrivee"
+        }
+        val btnTextSizeSp = 10f
+        pickStartButton = Button(this).apply {
+            text = "Choisir start"
+            textSize = btnTextSizeSp
+            isAllCaps = false
+            setOnClickListener {
+                resetNavigationForSelection()
+                startPoint = null
+                endPoint = null
+                startConfirmed = false
+                endConfirmed = false
+                selectMode = SelectMode.PICK_START
+                Toast.makeText(this@MainActivity, "Choisissez un point de depart", Toast.LENGTH_SHORT).show()
+                updateNavUi()
+                draw()
+            }
+        }
+        confirmStartButton = Button(this).apply {
+            text = "Valider start"
+            textSize = btnTextSizeSp
+            isAllCaps = false
+            setOnClickListener {
+                if (startPoint == null) {
+                    Toast.makeText(this@MainActivity, "Choisissez d'abord le start", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                startConfirmed = true
+                selectMode = SelectMode.NONE
+                Toast.makeText(this@MainActivity, "Start valide. Definissez l'arrivee.", Toast.LENGTH_SHORT).show()
+                updateNavUi()
+                draw()
+            }
+        }
+        pickEndButton = Button(this).apply {
+            text = "Choisir arrivee"
+            textSize = btnTextSizeSp
+            isAllCaps = false
+            setOnClickListener {
+                if (!startConfirmed) {
+                    Toast.makeText(this@MainActivity, "Validez d'abord le start", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                endConfirmed = false
+                selectMode = SelectMode.PICK_END
+                Toast.makeText(this@MainActivity, "Choisissez un point d'arrivee", Toast.LENGTH_SHORT).show()
+                updateNavUi()
+            }
+        }
+        confirmEndButton = Button(this).apply {
+            text = "Valider arrivee"
+            textSize = btnTextSizeSp
+            isAllCaps = false
+            setOnClickListener {
+                if (!startConfirmed || endPoint == null) {
+                    Toast.makeText(this@MainActivity, "Choisissez le start et l'arrivee", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                // Remet le compteur a zero avant de calculer un nouveau path
+                resetNavigationForSelection()
+                endConfirmed = true
+                selectMode = SelectMode.NONE
+                computePathAsync()
+                stepDetectionEnabled = true
+                Toast.makeText(this@MainActivity, "Arrivee validee. Vous pouvez marcher.", Toast.LENGTH_SHORT).show()
+                updateNavUi()
+            }
+        }
+        restartButton = Button(this).apply {
+            text = "Restart"
+            textSize = btnTextSizeSp
+            isAllCaps = false
+            setOnClickListener {
+                resetNavigationForSelection()
+                reinitYawFromCurrentIfAvailable()
+                startPoint = null
+                endPoint = null
+                startConfirmed = false
+                endConfirmed = false
+                selectMode = SelectMode.PICK_START
+                Toast.makeText(this@MainActivity, "Reset: choisissez un nouveau start", Toast.LENGTH_SHORT).show()
+                updateNavUi()
+                draw()
+            }
+        }
+
+        val hintLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            bottomMargin = (4f * resources.displayMetrics.density).toInt()
+        }
+        navControls.addView(navHintText, hintLp)
+
+        val row1 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+        }
+        val btnLp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            rightMargin = (4f * resources.displayMetrics.density).toInt()
+        }
+        row1.addView(pickStartButton, btnLp)
+        row1.addView(confirmStartButton, btnLp)
+        row1.addView(pickEndButton, btnLp)
+
+        row2.addView(confirmEndButton, btnLp)
+        row2.addView(restartButton, btnLp)
+
+        navControls.addView(row1)
+        navControls.addView(row2)
+
+        val navParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.END
+            rightMargin = margin
+            bottomMargin = margin
+        }
+        root.addView(navControls, navParams)
+        updateNavUi()
+
         calibButton = Button(this).apply {
             text = "START ÉTALONNAGE"
             setOnClickListener {
@@ -776,6 +942,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         imageView.visibility = View.GONE
         alignButton.visibility = View.GONE
+        navControls.visibility = View.GONE
         calibStopButton.visibility = View.GONE
         introVisible = true
 
@@ -861,6 +1028,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                             if (!introVisible) {
                                 imageView.visibility = View.VISIBLE
                                 alignButton.visibility = View.VISIBLE
+                                navControls.visibility = View.VISIBLE
+                                updateNavUi()
                                 requestDraw()
                             }
                         }
@@ -873,7 +1042,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
         }
 
-imageView.setOnTouchListener { v, e ->
+        imageView.setOnTouchListener { v, e ->
             if (mapReady) {
                 scaleDetector.onTouchEvent(e)
             }
@@ -881,13 +1050,47 @@ imageView.setOnTouchListener { v, e ->
                 MotionEvent.ACTION_DOWN -> {
                     lastTouchX = e.x
                     lastTouchY = e.y
+                    hasFocus = false
                     isPanning = false
                 }
                 MotionEvent.ACTION_POINTER_DOWN -> {
+                    var fx = 0f
+                    var fy = 0f
+                    for (i in 0 until e.pointerCount) {
+                        fx += e.getX(i)
+                        fy += e.getY(i)
+                    }
+                    lastFocusX = fx / e.pointerCount
+                    lastFocusY = fy / e.pointerCount
+                    hasFocus = true
                     isPanning = false
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (!isScaling && e.pointerCount == 1) {
+                    if (e.pointerCount >= 2) {
+                        var fx = 0f
+                        var fy = 0f
+                        for (i in 0 until e.pointerCount) {
+                            fx += e.getX(i)
+                            fy += e.getY(i)
+                        }
+                        val focusX = fx / e.pointerCount
+                        val focusY = fy / e.pointerCount
+                        if (!hasFocus) {
+                            lastFocusX = focusX
+                            lastFocusY = focusY
+                            hasFocus = true
+                        }
+                        val dx = focusX - lastFocusX
+                        val dy = focusY - lastFocusY
+                        if (dx != 0f || dy != 0f) {
+                            imageMatrixCurrent.postTranslate(dx, dy)
+                            constrainImageMatrix()
+                            imageView.imageMatrix = imageMatrixCurrent
+                            isPanning = true
+                        }
+                        lastFocusX = focusX
+                        lastFocusY = focusY
+                    } else if (!isScaling && e.pointerCount == 1) {
                         val dx = e.x - lastTouchX
                         val dy = e.y - lastTouchY
                         if (!isPanning && hypot(dx, dy) > touchSlop) {
@@ -911,9 +1114,11 @@ imageView.setOnTouchListener { v, e ->
                         }
                         v.performClick()
                     }
+                    hasFocus = false
                 }
                 MotionEvent.ACTION_CANCEL -> {
                     isPanning = false
+                    hasFocus = false
                 }
             }
             true
@@ -986,33 +1191,96 @@ imageView.setOnTouchListener { v, e ->
 
         val p = mapTouchToBitmap(e.x, e.y)
 
-        when {
-            startPoint == null -> {
-                resetNavigationState(keepPoints = false)
+        when (selectMode) {
+            SelectMode.PICK_START -> {
                 startPoint = p
-                Toast.makeText(this, "start", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Start choisi, validez", Toast.LENGTH_SHORT).show()
+                updateNavUi()
             }
-            endPoint == null -> {
-                // IMPORTANT : on garde startPoint
-                resetNavigationState(keepPoints = true)
+            SelectMode.PICK_END -> {
                 endPoint = p
-                Toast.makeText(this, "end", Toast.LENGTH_SHORT).show()
-                computePathAsync()
+                Toast.makeText(this, "Arrivee choisie, validez", Toast.LENGTH_SHORT).show()
+                updateNavUi()
             }
-            else -> {
-                resetNavigationState(keepPoints = false)
-                startPoint = null
-                endPoint = null
-                Toast.makeText(this, "Reset", Toast.LENGTH_SHORT).show()
+            SelectMode.NONE -> {
+                // Pas de selection active
             }
         }
         draw()
+    }
+
+    private fun setButtonEnabled(button: Button, enabled: Boolean) {
+        button.isEnabled = enabled
+        button.alpha = if (enabled) 1f else 0.45f
+    }
+
+    private fun updateNavUi() {
+        val canPickStart = !startConfirmed
+        val canConfirmStart = (startPoint != null) && !startConfirmed
+        val canPickEnd = startConfirmed && !endConfirmed
+        val canConfirmEnd = (endPoint != null) && startConfirmed && !endConfirmed
+
+        setButtonEnabled(pickStartButton, canPickStart)
+        setButtonEnabled(confirmStartButton, canConfirmStart)
+        setButtonEnabled(pickEndButton, canPickEnd)
+        setButtonEnabled(confirmEndButton, canConfirmEnd)
+        setButtonEnabled(restartButton, true)
+
+        val det = if (stepDetectionEnabled) "ON" else "OFF"
+        val hint = when {
+            !startConfirmed && selectMode == SelectMode.PICK_START -> "Tapez le start sur la carte"
+            !startConfirmed -> "1) Choisir start puis valider"
+            startConfirmed && !endConfirmed && selectMode == SelectMode.PICK_END -> "Tapez l'arrivee sur la carte"
+            startConfirmed && !endConfirmed -> "3) Choisir arrivee puis valider"
+            else -> "Vous pouvez marcher"
+        }
+        navHintText.text = "$hint\nDetection pas: $det"
+    }
+
+    private fun resetNavigationForSelection() {
+        navigationActive = false
+        navState = NavState.IDLE
+        yawOffsetLockedToPath = false
+        pendingStepsWhileLocked = 0
+        closeCsvLogger()
+
+        // distances/path
+        cumDistPx = floatArrayOf()
+        totalDistPx = 0f
+        totalSteps = 0
+        distNowPx = 0f
+        ratioNow = 0f
+        distAlongPx = 0f
+        pathResult = emptyList()
+
+        // steps (no sensor reset)
+        rawStepCount = 0
+        sentStepCount = 0
+
+        // map calib
+        heading0Abs = 0f
+        heading0Ready = false
+        drPosPx = PointF(0f, 0f)
+        drHasPos = false
+
+        // turns
+        turnEvents = emptyList()
+        nextTurnIdx = 0
+        turnLockActive = false
+        turnLockDir = ""
+        turnLockTargetAbs = 0f
+        turnGyroSeen = false
+        lastTurnHintIdx = -1
+        lastTurnHintStage = 0
+        lockOkCount = 0
     }
 
     // =================== RESET ===================
     private fun resetNavigationState(keepPoints: Boolean) {
         navigationActive = false
         navState = NavState.IDLE
+        startConfirmed = false
+        endConfirmed = false
         yawOffsetLockedToPath = false
         pendingStepsWhileLocked = 0
         yawSmoothPrevDeg = null
@@ -1056,6 +1324,7 @@ imageView.setOnTouchListener { v, e ->
         dtStepMs = 0L
         // IMPORTANT : repartir sur la référence USER (issue de l'étalonnage)
         stepPeriodMs = stepRefPeriodMsUser
+        stepLenNavM = stepLenMUser.coerceIn(stepLenMinM, stepLenMaxM)
         accelWinCount = 0
         accelWinIdx = 0
         accelSum = 0f
@@ -1130,6 +1399,17 @@ imageView.setOnTouchListener { v, e ->
         udpSendLine("CTRL,RESET")
     }
 
+    private fun reinitYawFromCurrentIfAvailable() {
+        val yawAbsSmooth = getYawSmoothAbsDegOrNull() ?: return
+        yawSmoothPrevDeg = yawAbsSmooth
+        yawAbsContDeg = yawAbsSmooth
+        yawOffsetContDeg = 0f
+        yawOffset = 0f
+        yawFiltered = normalizeAngle(yawAbsSmooth)
+        yawInit = true
+        lastYawTime = System.currentTimeMillis()
+    }
+
     // Reset TOTAL quand on quitte l'app (home / app switch)
     private fun resetAppToInitialUI() {
         resetNavigationState(keepPoints = false)
@@ -1147,7 +1427,9 @@ imageView.setOnTouchListener { v, e ->
             introPanel.visibility = View.VISIBLE
             imageView.visibility = View.GONE
             alignButton.visibility = View.GONE
+            navControls.visibility = View.GONE
             calibStopButton.visibility = View.GONE
+            updateNavUi()
 
             introStats.text = "Pret(e) quand vous l'etes."
 
@@ -1250,7 +1532,8 @@ imageView.setOnTouchListener { v, e ->
                 val dy = end.y - start.y
                 val straightDistPx = hypot(dx.toDouble(), dy.toDouble()).toFloat()
                 val distanceM = totalPx / PX_PER_M
-                val steps = max(1, round(distanceM / stepLenMUser).toInt())
+                stepLenNavM = stepLenMUser.coerceIn(stepLenMinM, stepLenMaxM)
+                val steps = max(1, ceil(distanceM / stepLenNavM.toDouble()).toInt())
 
                 // 5) Turn events
                 val turns = computeTurnEventsByDistance(computed, cd)
@@ -1301,6 +1584,7 @@ imageView.setOnTouchListener { v, e ->
                 sendPathToMatlab(computed)
                 navigationActive = true
                 navState = NavState.READY
+                stepDetectionEnabled = true
 
                 runOnUiThread {
                     Toast.makeText(
@@ -1414,16 +1698,46 @@ imageView.setOnTouchListener { v, e ->
                     val nowMs = e.timestamp / 1_000_000L
 
                     val amp = abs(filtMag)
-                    val (mu, sd) = updateAccelStats(amp)
+                    val (mu, sd) = updateAccelStatsRobust(amp)
                     // Calibration: marche lente => seuil adaptatif moins agressif.
                     // On garde ton plancher calibThreshMin (=1.2) mais on baisse K et z.
-                    val k = 0.9f
-                    val zMin = 2.0f
+                    val k = calibStepThreshK
+                    val zMin = calibStepZMin
                     val thresh = max(calibThreshMin, mu + k * sd)
-                    val z = if (sd > 1e-6f) (amp - mu) / sd else 0f
+                    val z = if (sd > calibMinStd) (amp - mu) / sd else 0f
 
                     val okDelay = nowMs - calibLastPeakMs >= calibMinPeakIntervalMs
                     val peakOk = (amp >= thresh) && (z >= zMin)
+                    if (DBG) {
+                        udpSendLine(
+                            "DBG_CALIB,amp=%.3f,th=%.3f,mu=%.3f,sd=%.3f,z=%.2f,delay=%d,okDelay=%b,peakOk=%b,armed=%b"
+                                .format(
+                                    Locale.US,
+                                    amp,
+                                    thresh,
+                                    mu,
+                                    sd,
+                                    z,
+                                    nowMs - calibLastPeakMs,
+                                    okDelay,
+                                    peakOk,
+                                    calibPeakArmed
+                                )
+                        )
+                    }
+                    if (DBG && calibPeakArmed) {
+                        if (!okDelay && peakOk) {
+                            udpSendLine(
+                                "DBG_CALIB_REJECT,reason=delay,amp=%.3f,th=%.3f,z=%.2f,delay=%d"
+                                    .format(Locale.US, amp, thresh, z, nowMs - calibLastPeakMs)
+                            )
+                        } else if (okDelay && !peakOk) {
+                            udpSendLine(
+                                "DBG_CALIB_REJECT,reason=thresh,amp=%.3f,th=%.3f,mu=%.3f,sd=%.3f,z=%.2f"
+                                    .format(Locale.US, amp, thresh, mu, sd, z)
+                            )
+                        }
+                    }
 
                     if (calibPeakArmed && okDelay && peakOk) {
                         calibStepCount++
@@ -1442,14 +1756,20 @@ imageView.setOnTouchListener { v, e ->
                             "CALIB STEP $calibStepCount amp=%.2f th=%.2f mu=%.2f sd=%.2f z=%.2f"
                                 .format(Locale.US, amp, thresh, mu, sd, z)
                         )
-                    } else if (amp < 0.5f * thresh) {
+                    } else if (amp < 0.7f * thresh || (nowMs - calibLastPeakMs) > (calibMinPeakIntervalMs * 18L / 10L)) {
                         // ré-armement quand on retombe bien en dessous
                         calibPeakArmed = true
+                        if (DBG) {
+                            udpSendLine(
+                                "DBG_CALIB_REARM,amp=%.3f,th=%.3f,delay=%d"
+                                    .format(Locale.US, amp, thresh, nowMs - calibLastPeakMs)
+                            )
+                        }
                     }
                     return
                 }
-                // navigation: pas detectes seulement si on est en RUNNING
-                if (!(navigationActive && navState == NavState.RUNNING)) return
+                // navigation: pas detectes seulement si navigation active (READY ou RUNNING)
+                if (!navigationActive) return
                 if (!stepDetectionEnabled) return
 
                 if (detectStepFromAccel(filtMag, e.timestamp)) {
@@ -1529,11 +1849,11 @@ imageView.setOnTouchListener { v, e ->
                         }
 
                         sentStepCount++
-                        val stepPx = stepLenPxDynNow()
+                        val stepPx = stepLenPxNav()
                         distAlongPx = min(totalDistPx, distAlongPx + stepPx)
                         udpSendLine(
                             "CTRL,STEPINFO,STEPLENM,%.3f,CAD,%.0f"
-                                .format(Locale.US, stepLenMdynNow(), cadenceSpmNow())
+                                .format(Locale.US, stepLenNavM, cadenceSpmNow())
                         )
                         val nowMs = System.currentTimeMillis()
                         udpSendLine("STEP_EVT,$sentStepCount,$nowMs")
@@ -1873,7 +2193,7 @@ imageView.setOnTouchListener { v, e ->
         val (meanAbs, stdAbs) = updateAccelStatsRobust(feed)
 
         // Seuil adaptatif leger + plancher (petits pas)
-        val threshFloor = 0.08f
+        val threshFloor = 0.09f
         val thresh = max(threshFloor, meanAbs + stepThreshK * stdAbs)
 
         // Prominence legere (si bruit faible)
@@ -1883,7 +2203,25 @@ imageView.setOnTouchListener { v, e ->
         val localMaxAbs = (absLast >= absPrev && absLast >= absCurr)
 
         val sinceLast = nowMs - lastStepAcceptedMs
-        if (localMaxAbs && sinceLast > dynMinDelayMs && (absLast > thresh || prominenceOk)) {
+        val passThresh = (absLast > thresh || prominenceOk)
+        val accept = localMaxAbs && sinceLast > dynMinDelayMs && passThresh
+        if (DBG && localMaxAbs && !accept) {
+            udpSendLine(
+                "DBGSTEP,REJECT,abs=%.4f,th=%.4f,mu=%.4f,sd=%.4f,delay=%d,min=%d,prom=%b,pass=%b"
+                    .format(
+                        Locale.US,
+                        absLast,
+                        thresh,
+                        meanAbs,
+                        stdAbs,
+                        sinceLast,
+                        dynMinDelayMs,
+                        prominenceOk,
+                        passThresh
+                    )
+            )
+        }
+        if (accept) {
 
             // update periode
             if (lastStepAcceptedMs != 0L) {
@@ -2042,6 +2380,8 @@ imageView.setOnTouchListener { v, e ->
             introPanel.visibility = View.GONE
             imageView.visibility = View.VISIBLE
             alignButton.visibility = View.VISIBLE
+            navControls.visibility = View.VISIBLE
+            updateNavUi()
             // On n'active pas les pas ici: ils s'activeront quand la nav passe RUNNING
             stepDetectionEnabled = true
             if (mapReady) {
@@ -2180,7 +2520,7 @@ imageView.setOnTouchListener { v, e ->
         if (total <= 0f) return
 
         distNowPx = distAlongPx.coerceIn(0f, total)
-        ratioNow = (distNowPx / total).coerceIn(0f, 1f)
+        updateRatioNow()
 
         val maxSeg = path.size - 2
         val segIdx = findSegmentIndexByDistance(cd, distNowPx).coerceIn(0, maxSeg)
@@ -2199,10 +2539,18 @@ imageView.setOnTouchListener { v, e ->
         drHasPos = true
     }
 
+    private fun updateRatioNow() {
+        ratioNow = when {
+            totalSteps > 0 -> (sentStepCount.toFloat() / totalSteps).coerceIn(0f, 1f)
+            totalDistPx > 0f -> (distNowPx / totalDistPx).coerceIn(0f, 1f)
+            else -> 0f
+        }
+    }
+
     private fun applyPendingSteps() {
         if (pendingStepsWhileLocked <= 0) return
         sentStepCount += pendingStepsWhileLocked
-        val stepPx = stepLenPxDynNow()
+        val stepPx = stepLenPxNav()
         distAlongPx = min(totalDistPx, distAlongPx + stepPx * pendingStepsWhileLocked)
         updatePositionFromAlongDistance()
         pendingStepsWhileLocked = 0
@@ -2417,7 +2765,7 @@ imageView.setOnTouchListener { v, e ->
             lines.add("Pas: $sentStepCount/$totalSteps")
             lines.add("Yaw: %.0f deg".format(Locale.US, yawFiltered))
             lines.add("Cadence: %.0f spm".format(Locale.US, cadenceSpmNow()))
-            lines.add("Pas: %.2f m".format(Locale.US, stepLenMdynNow()))
+            lines.add("Pas: %.2f m".format(Locale.US, stepLenNavM))
             val info = getNextTurnInfo()
             if (info != null) {
                 val distM = info.distM.coerceAtLeast(0f)
