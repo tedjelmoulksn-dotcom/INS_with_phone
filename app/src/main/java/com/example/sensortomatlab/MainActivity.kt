@@ -12,6 +12,7 @@ import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.ViewConfiguration
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -147,14 +148,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val paintCompassSeg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GREEN; strokeWidth = 4f }
     private val paintCompassText = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 24f }
 
-    private lateinit var alignButton: Button
     private lateinit var calibButton: Button
     private lateinit var calibStopButton: Button
     private lateinit var navControls: LinearLayout
+    private lateinit var navPanelScaleDetector: ScaleGestureDetector
+    private var navPanelScaling = false
+    private var navPanelDragging = false
+    private var navPanelDownMs = 0L
+    private var navPanelLastRawX = 0f
+    private var navPanelLastRawY = 0f
+    private var navPanelScale = 1f
+    private val navPanelScaleMin = 0.6f
+    private val navPanelScaleMax = 2.2f
+    private val navPanelStrokeIdle = Color.argb(60, 255, 255, 255)
+    private val navPanelStrokeActive = Color.argb(200, 255, 255, 255)
+    private val navPanelBgIdle = Color.argb(180, 20, 24, 30)
+    private val navPanelBgActive = Color.argb(220, 235, 240, 245)
+    private lateinit var navPanelBg: GradientDrawable
     private lateinit var pickStartButton: Button
-    private lateinit var confirmStartButton: Button
     private lateinit var pickEndButton: Button
-    private lateinit var confirmEndButton: Button
+    private lateinit var confirmButton: Button
     private lateinit var restartButton: Button
     private lateinit var navHintText: TextView
     private lateinit var introPanel: FrameLayout
@@ -668,55 +681,117 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             text = "Prêt(e) quand vous l’êtes."
         }
 
-        alignButton = Button(this).apply {
-            text = "ALIGN"
-            setOnClickListener {
-                val ok = calibrateYawToPath()
-                if (ok) {
-                    Toast.makeText(this@MainActivity, "Yaw aligned", Toast.LENGTH_SHORT).show()
-                } else {
-                    Toast.makeText(this@MainActivity, "Align failed", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
         val margin = (12f * resources.displayMetrics.density).toInt()
-        val alignParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            leftMargin = margin
-            topMargin = margin
-        }
-        root.addView(alignButton, alignParams)
 
         navControls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.END
             val pad = (4f * resources.displayMetrics.density).toInt()
             setPadding(pad, pad, pad, pad)
-            background = GradientDrawable().apply {
+            navPanelBg = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = 10f * resources.displayMetrics.density
-                setColor(Color.argb(180, 20, 24, 30))
+                setColor(navPanelBgIdle)
                 setStroke(
                     (1f * resources.displayMetrics.density).toInt(),
-                    Color.argb(60, 255, 255, 255)
+                    navPanelStrokeIdle
                 )
             }
+            background = navPanelBg
+        }
+        navPanelScaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                navPanelScaling = true
+                return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val scale = (navPanelScale * detector.scaleFactor)
+                    .coerceIn(navPanelScaleMin, navPanelScaleMax)
+                navPanelScale = scale
+                navControls.scaleX = scale
+                navControls.scaleY = scale
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                navPanelScaling = false
+            }
+        })
+
+        fun handleNavPanelTouch(event: MotionEvent, forwardClicks: Boolean): Boolean {
+            navPanelScaleDetector.onTouchEvent(event)
+            navControls.parent?.requestDisallowInterceptTouchEvent(true)
+
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    navPanelDownMs = System.currentTimeMillis()
+                    navPanelLastRawX = event.rawX
+                    navPanelLastRawY = event.rawY
+                    navPanelDragging = false
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (!navPanelScaleDetector.isInProgress) {
+                        val dx = event.rawX - navPanelLastRawX
+                        val dy = event.rawY - navPanelLastRawY
+                        val heldMs = System.currentTimeMillis() - navPanelDownMs
+                        if (!navPanelDragging && (heldMs > 200 || hypot(dx.toDouble(), dy.toDouble()).toFloat() > touchSlop)) {
+                            navPanelDragging = true
+                            navPanelBg.setStroke(
+                                (1f * resources.displayMetrics.density).toInt(),
+                                navPanelStrokeActive
+                            )
+                            navPanelBg.setColor(navPanelBgActive)
+                        }
+                        if (navPanelDragging) {
+                            navControls.translationX = navControls.translationX + dx
+                            navControls.translationY = navControls.translationY + dy
+                        }
+                        navPanelLastRawX = event.rawX
+                        navPanelLastRawY = event.rawY
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    navPanelBg.setStroke(
+                        (1f * resources.displayMetrics.density).toInt(),
+                        navPanelStrokeIdle
+                    )
+                    navPanelBg.setColor(navPanelBgIdle)
+                    if (!navPanelDragging && !navPanelScaleDetector.isInProgress && forwardClicks) {
+                        val target = findClickableChildAt(navControls, event.rawX, event.rawY)
+                        if (target != null) {
+                            target.performClick()
+                        } else {
+                            navControls.performClick()
+                        }
+                    }
+                    navPanelDragging = false
+                }
+            }
+
+            return if (forwardClicks) true else (navPanelDragging || navPanelScaleDetector.isInProgress)
+        }
+
+        val navChildTouchListener = View.OnTouchListener { _, event ->
+            handleNavPanelTouch(event, false)
+        }
+
+        navControls.setOnTouchListener { _, event ->
+            handleNavPanelTouch(event, true)
         }
         navHintText = TextView(this).apply {
             setTextColor(Color.argb(230, 220, 230, 245))
-            textSize = 9.5f
-            maxLines = 2
+            textSize = 12f
+            maxLines = 4
             ellipsize = TextUtils.TruncateAt.END
-            text = "1) Choisir start\n2) Valider start\n3) Choisir arrivee\n4) Valider arrivee"
+            text = "Choose the start, confirm, then choose the destination."
         }
-        val btnTextSizeSp = 10f
+        val btnTextSizeSp = 12f
         pickStartButton = Button(this).apply {
-            text = "Choisir start"
+            text = "Choose start"
             textSize = btnTextSizeSp
             isAllCaps = false
+            isLongClickable = false
             setOnClickListener {
                 resetNavigationForSelection()
                 startPoint = null
@@ -724,58 +799,58 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 startConfirmed = false
                 endConfirmed = false
                 selectMode = SelectMode.PICK_START
-                Toast.makeText(this@MainActivity, "Choisissez un point de depart", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Tap a start point", Toast.LENGTH_SHORT).show()
                 updateNavUi()
                 draw()
             }
         }
-        confirmStartButton = Button(this).apply {
-            text = "Valider start"
+        confirmButton = Button(this).apply {
+            text = "Confirm"
             textSize = btnTextSizeSp
             isAllCaps = false
+            isLongClickable = false
             setOnClickListener {
-                if (startPoint == null) {
-                    Toast.makeText(this@MainActivity, "Choisissez d'abord le start", Toast.LENGTH_SHORT).show()
+                if (!startConfirmed) {
+                    if (startPoint == null) {
+                        Toast.makeText(this@MainActivity, "Pick the start first", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    startConfirmed = true
+                    selectMode = SelectMode.NONE
+                    Toast.makeText(this@MainActivity, "Start confirmed. Now pick the destination.", Toast.LENGTH_SHORT).show()
+                    updateNavUi()
+                    draw()
                     return@setOnClickListener
                 }
-                startConfirmed = true
-                selectMode = SelectMode.NONE
-                Toast.makeText(this@MainActivity, "Start valide. Definissez l'arrivee.", Toast.LENGTH_SHORT).show()
-                updateNavUi()
-                draw()
+                if (startConfirmed && !endConfirmed) {
+                    if (endPoint == null) {
+                        Toast.makeText(this@MainActivity, "Pick the destination first", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    resetNavigationForSelection()
+                    endConfirmed = true
+                    selectMode = SelectMode.NONE
+                    computePathAsync()
+                    stepDetectionEnabled = true
+                    Toast.makeText(this@MainActivity, "Destination confirmed. You can walk.", Toast.LENGTH_SHORT).show()
+                    updateNavUi()
+                    return@setOnClickListener
+                }
             }
         }
         pickEndButton = Button(this).apply {
-            text = "Choisir arrivee"
+            text = "Choose destination"
             textSize = btnTextSizeSp
             isAllCaps = false
+            isLongClickable = false
             setOnClickListener {
                 if (!startConfirmed) {
-                    Toast.makeText(this@MainActivity, "Validez d'abord le start", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Confirm the start first", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
                 endConfirmed = false
                 selectMode = SelectMode.PICK_END
-                Toast.makeText(this@MainActivity, "Choisissez un point d'arrivee", Toast.LENGTH_SHORT).show()
-                updateNavUi()
-            }
-        }
-        confirmEndButton = Button(this).apply {
-            text = "Valider arrivee"
-            textSize = btnTextSizeSp
-            isAllCaps = false
-            setOnClickListener {
-                if (!startConfirmed || endPoint == null) {
-                    Toast.makeText(this@MainActivity, "Choisissez le start et l'arrivee", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
-                }
-                // Remet le compteur a zero avant de calculer un nouveau path
-                resetNavigationForSelection()
-                endConfirmed = true
-                selectMode = SelectMode.NONE
-                computePathAsync()
-                stepDetectionEnabled = true
-                Toast.makeText(this@MainActivity, "Arrivee validee. Vous pouvez marcher.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Tap a destination point", Toast.LENGTH_SHORT).show()
                 updateNavUi()
             }
         }
@@ -783,6 +858,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             text = "Restart"
             textSize = btnTextSizeSp
             isAllCaps = false
+            isLongClickable = false
             setOnClickListener {
                 resetNavigationForSelection()
                 reinitYawFromCurrentIfAvailable()
@@ -791,7 +867,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 startConfirmed = false
                 endConfirmed = false
                 selectMode = SelectMode.PICK_START
-                Toast.makeText(this@MainActivity, "Reset: choisissez un nouveau start", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Reset: choose a new start", Toast.LENGTH_SHORT).show()
                 updateNavUi()
                 draw()
             }
@@ -813,14 +889,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.END
         }
-        val btnLp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+        val btnLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply {
             rightMargin = (4f * resources.displayMetrics.density).toInt()
         }
+        row1.setOnTouchListener(navChildTouchListener)
+        row2.setOnTouchListener(navChildTouchListener)
+        navHintText.setOnTouchListener(navChildTouchListener)
+        pickStartButton.setOnTouchListener(navChildTouchListener)
+        confirmButton.setOnTouchListener(navChildTouchListener)
+        pickEndButton.setOnTouchListener(navChildTouchListener)
+        restartButton.setOnTouchListener(navChildTouchListener)
         row1.addView(pickStartButton, btnLp)
-        row1.addView(confirmStartButton, btnLp)
-        row1.addView(pickEndButton, btnLp)
+        row1.addView(confirmButton, btnLp)
 
-        row2.addView(confirmEndButton, btnLp)
+        row2.addView(pickEndButton, btnLp)
         row2.addView(restartButton, btnLp)
 
         navControls.addView(row1)
@@ -941,7 +1026,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         setContentView(root)
 
         imageView.visibility = View.GONE
-        alignButton.visibility = View.GONE
         navControls.visibility = View.GONE
         calibStopButton.visibility = View.GONE
         introVisible = true
@@ -1027,7 +1111,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                             // mais si l'intro est déjà fermée => afficher immédiatement.
                             if (!introVisible) {
                                 imageView.visibility = View.VISIBLE
-                                alignButton.visibility = View.VISIBLE
                                 navControls.visibility = View.VISIBLE
                                 updateNavUi()
                                 requestDraw()
@@ -1194,7 +1277,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         when (selectMode) {
             SelectMode.PICK_START -> {
                 startPoint = p
-                Toast.makeText(this, "Start choisi, validez", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Depart choisi, validez", Toast.LENGTH_SHORT).show()
                 updateNavUi()
             }
             SelectMode.PICK_END -> {
@@ -1209,30 +1292,53 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         draw()
     }
 
+    private fun findClickableChildAt(root: ViewGroup, rawX: Float, rawY: Float): View? {
+        val loc = IntArray(2)
+        for (i in root.childCount - 1 downTo 0) {
+            val child = root.getChildAt(i)
+            if (child.visibility != View.VISIBLE) continue
+            child.getLocationOnScreen(loc)
+            val rect = Rect(loc[0], loc[1], loc[0] + child.width, loc[1] + child.height)
+            if (rect.contains(rawX.toInt(), rawY.toInt())) {
+                if (child is ViewGroup) {
+                    val hit = findClickableChildAt(child, rawX, rawY)
+                    if (hit != null) return hit
+                }
+                if (child.isClickable) return child
+            }
+        }
+        return null
+    }
+
     private fun setButtonEnabled(button: Button, enabled: Boolean) {
+        if (::restartButton.isInitialized && button === restartButton) {
+            button.isEnabled = true
+            button.alpha = 1f
+            return
+        }
         button.isEnabled = enabled
         button.alpha = if (enabled) 1f else 0.45f
     }
 
     private fun updateNavUi() {
         val canPickStart = !startConfirmed
-        val canConfirmStart = (startPoint != null) && !startConfirmed
         val canPickEnd = startConfirmed && !endConfirmed
+        val canConfirmStart = (startPoint != null) && !startConfirmed
         val canConfirmEnd = (endPoint != null) && startConfirmed && !endConfirmed
 
         setButtonEnabled(pickStartButton, canPickStart)
-        setButtonEnabled(confirmStartButton, canConfirmStart)
+        setButtonEnabled(confirmButton, canConfirmStart || canConfirmEnd)
         setButtonEnabled(pickEndButton, canPickEnd)
-        setButtonEnabled(confirmEndButton, canConfirmEnd)
         setButtonEnabled(restartButton, true)
+        restartButton.visibility = View.VISIBLE
 
         val det = if (stepDetectionEnabled) "ON" else "OFF"
         val hint = when {
-            !startConfirmed && selectMode == SelectMode.PICK_START -> "Tapez le start sur la carte"
-            !startConfirmed -> "1) Choisir start puis valider"
-            startConfirmed && !endConfirmed && selectMode == SelectMode.PICK_END -> "Tapez l'arrivee sur la carte"
-            startConfirmed && !endConfirmed -> "3) Choisir arrivee puis valider"
-            else -> "Vous pouvez marcher"
+            !startConfirmed && selectMode == SelectMode.PICK_START -> "Touchez la carte pour placer le depart"
+            !startConfirmed -> "1) Choisir le depart puis valider"
+            startConfirmed && !endConfirmed && selectMode == SelectMode.PICK_END -> "Touchez la carte pour placer l'arrivee"
+            startConfirmed && !endConfirmed -> "3) Choisir l'arrivee puis valider"
+            else -> "Pret: vous pouvez marcher"
         }
         navHintText.text = "$hint\nDetection pas: $det"
     }
@@ -1426,7 +1532,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         runOnUiThread {
             introPanel.visibility = View.VISIBLE
             imageView.visibility = View.GONE
-            alignButton.visibility = View.GONE
             navControls.visibility = View.GONE
             calibStopButton.visibility = View.GONE
             updateNavUi()
@@ -2379,7 +2484,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             introVisible = false
             introPanel.visibility = View.GONE
             imageView.visibility = View.VISIBLE
-            alignButton.visibility = View.VISIBLE
             navControls.visibility = View.VISIBLE
             updateNavUi()
             // On n'active pas les pas ici: ils s'activeront quand la nav passe RUNNING
