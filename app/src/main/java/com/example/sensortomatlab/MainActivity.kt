@@ -32,9 +32,19 @@ import kotlin.math.*
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
+    companion object {
+        // Constantes rapides / tolerantes pour lock gyro
+        private const val GYRO_RATE_MIN = 0.10f        // rad/s ~ 5.7deg/s
+        private const val GYRO_HOLD_MS = 140L          // 140ms bon sens => OK
+        private const val GYRO_TURN_DEG_MIN = 18f      // ~18deg suffit pour dire "il a tourne"
+        private const val TURN_MIN_LOCK_MS = 120L      // evite release instantane par bruit
+        private const val TURN_MAX_LOCK_MS = 2000L     // securite
+    }
+
     // =================== RECORDING / APP STATE ===================
     // Pas detectes seulement quand on "enregistre" (calib) ou quand la nav est RUNNING.
     @Volatile private var stepDetectionEnabled = false
+    private val showToasts = false
 
     // =================== USER PARAMS ===================
     private val PX_PER_M = 30f       // calibration px/m 31.06
@@ -56,6 +66,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun cadenceSpmNow(): Float = (60000f / stepPeriodMs).coerceIn(40f, 260f)
     private fun cadenceSpmInstant(): Float =
         if (dtStepMs > 0) (60000f / dtStepMs.toFloat()).coerceIn(40f, 260f) else cadenceSpmNow()
+
+    private fun showToast(message: String, length: Int = Toast.LENGTH_SHORT) {
+        if (!showToasts) return
+        runOnUiThread { Toast.makeText(this, message, length).show() }
+    }
 
     // Si yawRel part toujours dans le mÃªme sens (gauche/droite), mets true
     private val INVERT_YAW = false
@@ -150,6 +165,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private lateinit var calibButton: Button
     private lateinit var calibStopButton: Button
+    private lateinit var calibRestartButton: Button
     private lateinit var navControls: LinearLayout
     private lateinit var navPanelScaleDetector: ScaleGestureDetector
     private var navPanelScaling = false
@@ -169,6 +185,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var pickEndButton: Button
     private lateinit var confirmButton: Button
     private lateinit var restartButton: Button
+    private lateinit var pauseResumeButton: Button
     private lateinit var navHintText: TextView
     private lateinit var introPanel: FrameLayout
     private lateinit var introTitle: TextView
@@ -231,7 +248,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     // step detection (band-pass + peak/zero-cross)
     // Marche lente: 0.7 Hz coupe parfois trop -> on descend à 0.5 Hz
-    private val stepBandLowHz = 0.25f
+    private val stepBandLowHz = 0.6f
     private val stepBandHighHz = 3.0f
     // Un peu moins agressif pour ne pas rater les pas lents
     private val stepThreshK = 0.18f          // un peu moins sensible
@@ -249,8 +266,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var prevFilt = 0f
 
     // =================== STEP TIMING (NEW) ===================
-    private var stepPeriodMs = 550f
-    private var lastStepAcceptedMs = 0L
+    // --- STEP state (important: update only on accepted step) ---
+    private var stepPeriodMs = 620f
+    private var lastAcceptedStepMs = 0L
     private var dtStepMs = 0L
     private val stepPeriodAlpha = 0.15f
     private val stepPeriodMinMs = 250f
@@ -275,13 +293,40 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val calibStepTimes = ArrayList<Long>(64)
     private var calibLastPeakMs = 0L
     private var calibPeakArmed = true
-    private val calibStepThreshK = 0.55f
-    private val calibStepZMin = 0.9f
-    private val calibThreshMin = 0.40f         // post-filtrage
-    private val calibMinStd = 0.07f
-    private val calibMinPeakIntervalMs = 380L
+    private val calibStepThreshK = 0.75f
+    private val calibStepZMin = 0.75f
+    private val calibThreshMin = 0.5f         // post-filtrage
+    private val calibMinStd = 0.03f
+    private val calibMinPeakIntervalMs =10L
     private val calibMaxRefPeriodMs = 1600f
-    private var stepRefPeriodMsUser = 550f
+    // --- CALIB SIMPLE PEAK LOGIC (NEW) ---
+    private var calibPerturbations = 0
+    private val calibAmpThresh = 1.2f          // amplitude fixe (post-filtrage)
+    private val calibAmpMax =5f             // amplitude max pour un pas
+    private val calibCandidateMinAmp = 1.2f    // candidats seulement au-dessus de 1.2
+    private val calibPertMinAmp = 1.7f         // perturbations comptées seulement >= 1.7
+    private val calibMinDtMs = 450L            // bruit si < 0.45 s
+    private val calibMaxDtMs = 3200L           // cadence lente
+    private val calibRearmRatio = 0.50f        // rearm quand on redescend sous 50% du seuil
+    private var calibLastDbgMs = 0L
+    private var calibPosLobeStartMs = 0L
+    private var calibHasPeakCandidate = false
+    private var calibPeakCandidateAmp = 0f
+    private var calibPeakCandidateTimeMs = 0L
+    private var calibPeakCandidateDtMs = 0L
+    private var calibLastAnyPeakMs = 0L
+    private val calibPeakWidthRejectMs = 120L  // bruit si pic < 0.12 s
+    private val calibPeakWidthAcceptMs = 120L  // pas si pic >= 0.12 s
+    private val calibPeakWidthMaxMs = 400L     // bruit si pic trop large
+    // Nav: detection de pas identique a l'etalonnage (pics)
+    private var navPeakArmed = true
+    private var navPosLobeStartMs = 0L
+    private var navHasPeakCandidate = false
+    private var navPeakCandidateAmp = 0f
+    private var navPeakCandidateTimeMs = 0L
+    private var navPeakCandidateDtMs = 0L
+    private var navLastAnyPeakMs = 0L
+    private var stepRefPeriodMsUser = 600f
     private var stepRefLenMUser = STEP_LEN_M
     private var stepLenMUser = STEP_LEN_M
     private var stepLenNavM = STEP_LEN_M
@@ -328,6 +373,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // =================== NAV STATE ===================
     enum class NavState { IDLE, READY, RUNNING, FINISHED }
     @Volatile private var navState = NavState.IDLE
+    private var navPaused = false
     @Volatile private var navigationActive = false
 
     // position estime sur la carte
@@ -401,13 +447,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (path.size < 2 || cd.size != path.size || totalDistPx <= 0f) return false
     //    path.size < 2 : il faut au moins 2 points pour faire un segment.
 
-      //  cd.size != path.size : si les distances cumulées ne correspondent pas au path → incohérent.
+      //  cd.size != path.size : si les distances cumulées ne correspondent pas au path ? incohérent.
 
         //totalDistPx <= 0f : distance totale invalide (path vide ou bug).
-        // Si une condition est vraie : on ne peut pas calibrer → false.
+        // Si une condition est vraie : on ne peut pas calibrer ? false.
         val maxSeg = path.size - 2
         val segIdx = findSegmentIndexByDistance(cd, distNowPx).coerceIn(0, maxSeg)
-     //   Un path de N points a N-1 segments : segment 0 = (0→1), segment 1 = (1→2), etc.
+     //   Un path de N points a N-1 segments : segment 0 = (0?1), segment 1 = (1?2), etc.
 
      //   maxSeg = path.size - 2 : index maximum possible pour segIdx car on accède à segIdx + 1.
 
@@ -446,7 +492,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         Ensuite :
 
-        Math.toDegrees(...) convertit radians → degrés.
+        Math.toDegrees(...) convertit radians ? degrés.
 
         normalizeAngle(...) remet l’angle dans une plage standard (souvent [0,360) ou (-180,180] selon l’implémentation).
         Sans ça, tu peux avoir des valeurs négatives ou >360.*/
@@ -457,7 +503,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         val yawAbsSmooth = getYawSmoothAbsDegOrNull() ?: return false
         /*Récupère le yaw du téléphone lissé/filtré, en degrés, absolu.
-        Si pas dispo (null) → impossible de calibrer → false.*/
+        Si pas dispo (null) ? impossible de calibrer ? false.*/
 
         yawSmoothPrevDeg = yawAbsSmooth
         yawAbsContDeg = yawAbsSmooth
@@ -490,7 +536,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val deadZone = 8f
     private val correctionThreshold = 18f
 
-    private val lookAheadPx = 15f // a tester
+    // Lock seulement tres proche du point de virage (pas a 1m avant)
+    private val turnLockLeadPx = 6f   // ~0.20 m si PX_PER_M=30
+
+    // Validation: on exige alignement yaw sur la nouvelle direction
+    private val turnYawAcceptDeg = TURN_END  // 15 deg
+
+    // Gyro integration pendant lock (robuste)
+    private var turnGyroAngleDeg = 0f
+    private var turnLockStartMs = 0L
+    private var lockMaxYawErrDeg = 0f
+    private var turnSawLargeErr = false
+
+    // Minimum de "vrai virage" avant d'autoriser validation
+    private val minTurnAngleFromGyroDeg = 25f
+    private val lockTimeoutMs = 7000L  // anti-blocage dur
+
+    private val lookAheadPx = 30f // ~1.0 m avant le virage
     private val minStepsBeforeFirstLock = 3
     private var lastUiTurnMsg = ""
     private var lastUiTurnTime = 0L
@@ -498,6 +560,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // Anti validation virage toute seule : on exige plusieurs ticks dans la zone
     private var lockOkCount = 0
     private val lockOkNeeded = 6 // 6 ticks * 50ms â‰ˆ 300ms (avec yawTick), trÃ¨s efficace
+    private var lockGyroOkCount = 0
+    private val lockGyroOkNeeded = 6
 
     data class TurnEvent(
         val atDistPx: Float,
@@ -513,11 +577,30 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var nextTurnIdx = 0
     private var pendingStepsWhileLocked = 0
 
+    // --- TURN LOCK state ---
     private var turnLockActive = false
+    private var turnDirSign = 0              // +1 RIGHT, -1 LEFT
+    private var turnGyroZLp = 0f             // gyro filtre
+    private var turnGyroHoldMs = 0L          // duree gyro bon sens
+    private var turnGyroAccumRad = 0f        // integrale gyro (rotation)
+    // --- TURN LOCK timing: use SENSOR TIMESTAMP ONLY ---
+    private var turnStartTsNs = 0L
+    private var turnLastTsNs = 0L
+
+    // --- debug throttle ---
+    private var turnDbgLastMs = 0L
+    private var turnVibeDone = false
     private var turnLockDir = ""
     private var turnLockTargetAbs = 0f
+    private var turnLockTargetRel = 0f
+    private var turnLockSuppressed = false
+    private var turnLockSuppressUntilDistPx = 0f
     private val turnGyroVarMin = 0.015f
     private var turnGyroSeen = false
+    private var turnGyroPhase = 0
+    private var turnGyroStableCount = 0
+    private val gyroZStableThreshold = 0.08f
+    private val gyroZStableNeeded = 6
 
     // =================== TURN BY GYRO Z ONLY ===================
     private var lastGyroZ = 0f
@@ -609,7 +692,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (msg == lastUiTurnMsg && now - lastUiTurnTime < 600) return
         lastUiTurnMsg = msg
         lastUiTurnTime = now
-        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+        showToast(msg)
     }
 
     // =================== LIFECYCLE ===================
@@ -799,7 +882,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 startConfirmed = false
                 endConfirmed = false
                 selectMode = SelectMode.PICK_START
-                Toast.makeText(this@MainActivity, "Tap a start point", Toast.LENGTH_SHORT).show()
+                showToast("Tap a start point")
                 updateNavUi()
                 draw()
             }
@@ -812,19 +895,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             setOnClickListener {
                 if (!startConfirmed) {
                     if (startPoint == null) {
-                        Toast.makeText(this@MainActivity, "Pick the start first", Toast.LENGTH_SHORT).show()
+                        showToast("Pick the start first")
                         return@setOnClickListener
                     }
                     startConfirmed = true
                     selectMode = SelectMode.NONE
-                    Toast.makeText(this@MainActivity, "Start confirmed. Now pick the destination.", Toast.LENGTH_SHORT).show()
+                    showToast("Start confirmed. Now pick the destination.")
                     updateNavUi()
                     draw()
                     return@setOnClickListener
                 }
                 if (startConfirmed && !endConfirmed) {
                     if (endPoint == null) {
-                        Toast.makeText(this@MainActivity, "Pick the destination first", Toast.LENGTH_SHORT).show()
+                        showToast("Pick the destination first")
                         return@setOnClickListener
                     }
                     resetNavigationForSelection()
@@ -832,7 +915,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     selectMode = SelectMode.NONE
                     computePathAsync()
                     stepDetectionEnabled = true
-                    Toast.makeText(this@MainActivity, "Destination confirmed. You can walk.", Toast.LENGTH_SHORT).show()
+                    showToast("Destination confirmed. You can walk.")
                     updateNavUi()
                     return@setOnClickListener
                 }
@@ -845,12 +928,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             isLongClickable = false
             setOnClickListener {
                 if (!startConfirmed) {
-                    Toast.makeText(this@MainActivity, "Confirm the start first", Toast.LENGTH_SHORT).show()
+                    showToast("Confirm the start first")
                     return@setOnClickListener
                 }
                 endConfirmed = false
                 selectMode = SelectMode.PICK_END
-                Toast.makeText(this@MainActivity, "Tap a destination point", Toast.LENGTH_SHORT).show()
+                showToast("Tap a destination point")
                 updateNavUi()
             }
         }
@@ -867,14 +950,31 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 startConfirmed = false
                 endConfirmed = false
                 selectMode = SelectMode.PICK_START
-                Toast.makeText(this@MainActivity, "Reset: choose a new start", Toast.LENGTH_SHORT).show()
+                showToast("Reset: choose a new start")
                 updateNavUi()
                 draw()
             }
         }
+        pauseResumeButton = Button(this).apply {
+            text = "Pause"
+            textSize = btnTextSizeSp
+            isAllCaps = false
+            isLongClickable = false
+            setOnClickListener {
+                if (navState != NavState.RUNNING) {
+                    showToast("Navigation pas active")
+                    return@setOnClickListener
+                }
+                navPaused = !navPaused
+                stepDetectionEnabled = !navPaused
+                text = if (navPaused) "Reprendre" else "Pause"
+                showToast(if (navPaused) "Navigation en pause" else "Navigation reprise")
+                updateNavUi()
+            }
+        }
 
         val hintLp = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply {
             bottomMargin = (4f * resources.displayMetrics.density).toInt()
@@ -902,22 +1002,27 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         confirmButton.setOnTouchListener(navChildTouchListener)
         pickEndButton.setOnTouchListener(navChildTouchListener)
         restartButton.setOnTouchListener(navChildTouchListener)
+        pauseResumeButton.setOnTouchListener(navChildTouchListener)
         row1.addView(pickStartButton, btnLp)
         row1.addView(confirmButton, btnLp)
 
         row2.addView(pickEndButton, btnLp)
+        row2.addView(pauseResumeButton, btnLp)
         row2.addView(restartButton, btnLp)
 
         navControls.addView(row1)
         navControls.addView(row2)
 
+        navControls.minimumWidth = (280f * resources.displayMetrics.density).toInt()
+
         val navParams = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.END
             rightMargin = margin
             bottomMargin = margin
+            leftMargin = margin
         }
         root.addView(navControls, navParams)
         updateNavUi()
@@ -925,40 +1030,28 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         calibButton = Button(this).apply {
             text = "START ÉTALONNAGE"
             setOnClickListener {
-                if (!calibWaitingStart) return@setOnClickListener
-
-                calibWaitingStart = false
-                calibActive = true
-                stepDetectionEnabled = true   // pas actifs UNIQUEMENT apres COMMENCER
-                calibStepCount = 0
-                calibStepTimes.clear()
-                calibStepAmps.clear()
-                calibLastPeakMs = 0L
-                calibPeakArmed = true
-                calibStopButton.visibility = View.VISIBLE
-
-                // IMPORTANT: reset stats pour seuil adaptatif étalonnage (évite pollution)
-                accelWinCount = 0
-                accelWinIdx = 0
-                accelSum = 0f
-                accelSumSq = 0f
-
-                introStats.text =
-                    "Enregistrement en cours…\n" +
-                    "Marchez normalement. Pas détectés : 0"
-
-                Log.i(TAG, "CALIB START")
+                startCalibrationIfReady()
             }
         }
         calibButton.text = "COMMENCER"
         calibStopButton = Button(this).apply {
             text = "FIN ÉTALONNAGE"
             setOnClickListener {
-                if (!calibActive || calibStepCount < 2) return@setOnClickListener
+                if (!calibActive) return@setOnClickListener
+                if (calibStepCount < 2) {
+                    resetCalibrationToReady("Étalonnage arrêté.")
+                    return@setOnClickListener
+                }
                 finishCalibrationWithDistance()
             }
         }
         calibStopButton.text = "ARRÊT"
+        calibRestartButton = Button(this).apply {
+            text = "RECOMMENCER"
+            setOnClickListener {
+                resetCalibrationToReady("Étalonnage remis à zéro.\nAppuyez sur COMMENCER.")
+            }
+        }
 
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -973,6 +1066,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
         btnRow.addView(
             calibStopButton,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                leftMargin = btnPad
+                rightMargin = btnPad
+            }
+        )
+        btnRow.addView(
+            calibRestartButton,
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 leftMargin = btnPad
             }
@@ -1119,7 +1219,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         Log.i(TAG, "Map ready: ${bmpPlan.width}x${bmpPlan.height}")
                     } catch (t: Throwable) {
                         Log.e(TAG, "Map init error", t)
-                        runOnUiThread { Toast.makeText(this, "Erreur init carte", Toast.LENGTH_LONG).show() }
+                        showToast("Erreur init carte", Toast.LENGTH_LONG)
                     }
                 }.start()
             }
@@ -1268,7 +1368,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // =================== CLICK ===================
     private fun handleClick(e: MotionEvent) {
         if (!mapReady) {
-            Toast.makeText(this, "Carte en preparation...", Toast.LENGTH_SHORT).show()
+            showToast("Carte en preparation...")
             return
         }
 
@@ -1277,12 +1377,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         when (selectMode) {
             SelectMode.PICK_START -> {
                 startPoint = p
-                Toast.makeText(this, "Depart choisi, validez", Toast.LENGTH_SHORT).show()
+                showToast("Depart choisi, validez")
                 updateNavUi()
             }
             SelectMode.PICK_END -> {
                 endPoint = p
-                Toast.makeText(this, "Arrivee choisie, validez", Toast.LENGTH_SHORT).show()
+                showToast("Arrivee choisie, validez")
                 updateNavUi()
             }
             SelectMode.NONE -> {
@@ -1330,6 +1430,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         setButtonEnabled(confirmButton, canConfirmStart || canConfirmEnd)
         setButtonEnabled(pickEndButton, canPickEnd)
         setButtonEnabled(restartButton, true)
+        setButtonEnabled(pauseResumeButton, navState == NavState.RUNNING)
+        pauseResumeButton.visibility = View.VISIBLE
         restartButton.visibility = View.VISIBLE
 
         val det = if (stepDetectionEnabled) "ON" else "OFF"
@@ -1340,12 +1442,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             startConfirmed && !endConfirmed -> "3) Choisir l'arrivee puis valider"
             else -> "Pret: vous pouvez marcher"
         }
+        pauseResumeButton.text = if (navPaused) "Reprendre" else "Pause"
         navHintText.text = "$hint\nDetection pas: $det"
     }
 
     private fun resetNavigationForSelection() {
         navigationActive = false
         navState = NavState.IDLE
+        navPaused = false
+        stepDetectionEnabled = false
         yawOffsetLockedToPath = false
         pendingStepsWhileLocked = 0
         closeCsvLogger()
@@ -1373,18 +1478,36 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         turnEvents = emptyList()
         nextTurnIdx = 0
         turnLockActive = false
+        turnDirSign = 0
+        turnGyroZLp = 0f
+        turnGyroHoldMs = 0L
+        turnGyroAccumRad = 0f
+        turnStartTsNs = 0L
+        turnLastTsNs = 0L
+        turnVibeDone = false
         turnLockDir = ""
         turnLockTargetAbs = 0f
+        turnLockTargetRel = 0f
+        turnLockSuppressed = false
+        turnLockSuppressUntilDistPx = 0f
         turnGyroSeen = false
+        turnGyroAngleDeg = 0f
+        turnDbgLastMs = 0L
+        turnLockStartMs = 0L
+        lockMaxYawErrDeg = 0f
+        turnSawLargeErr = false
         lastTurnHintIdx = -1
         lastTurnHintStage = 0
         lockOkCount = 0
+
+        resetNavStepDetectionState()
     }
 
     // =================== RESET ===================
     private fun resetNavigationState(keepPoints: Boolean) {
         navigationActive = false
         navState = NavState.IDLE
+        navPaused = false
         startConfirmed = false
         endConfirmed = false
         yawOffsetLockedToPath = false
@@ -1426,7 +1549,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         waitingZeroCross = false
         peakTimeMs = 0L
         lastStepTimeMs = 0L
-        lastStepAcceptedMs = 0L
+        lastAcceptedStepMs = 0L
         dtStepMs = 0L
         // IMPORTANT : repartir sur la référence USER (issue de l'étalonnage)
         stepPeriodMs = stepRefPeriodMsUser
@@ -1485,9 +1608,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         turnEvents = emptyList()
         nextTurnIdx = 0
         turnLockActive = false
+        turnDirSign = 0
+        turnGyroZLp = 0f
+        turnGyroHoldMs = 0L
+        turnGyroAccumRad = 0f
+        turnStartTsNs = 0L
+        turnLastTsNs = 0L
+        turnVibeDone = false
         turnLockDir = ""
         turnLockTargetAbs = 0f
+        turnLockTargetRel = 0f
+        turnLockSuppressed = false
+        turnLockSuppressUntilDistPx = 0f
         turnGyroSeen = false
+        turnDbgLastMs = 0L
         lastTurnHintIdx = -1
         lastTurnHintStage = 0
 
@@ -1533,39 +1667,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             introPanel.visibility = View.VISIBLE
             imageView.visibility = View.GONE
             navControls.visibility = View.GONE
-            calibStopButton.visibility = View.GONE
             updateNavUi()
-
-            introStats.text = "Pret(e) quand vous l'etes."
-
-            calibButton.visibility = View.VISIBLE
-            calibButton.text = "COMMENCER"
-            calibButton.setOnClickListener {
-                if (!calibWaitingStart) return@setOnClickListener
-
-                calibWaitingStart = false
-                calibActive = true
-                stepDetectionEnabled = true   // pas actifs UNIQUEMENT apres COMMENCER
-
-                calibStepCount = 0
-                calibStepTimes.clear()
-                calibLastPeakMs = 0L
-                calibPeakArmed = true
-                calibStopButton.visibility = View.VISIBLE
-
-                // reset stats pour seuil adaptatif
-                accelWinCount = 0
-                accelWinIdx = 0
-                accelSum = 0f
-                accelSumSq = 0f
-
-                introStats.text =
-                    "Enregistrement en cours...\n" +
-                    "Marchez normalement. Pas detectes : 0"
-
-                Log.i(TAG, "CALIB START")
-            }
         }
+        resetCalibrationToReady("Pret(e) quand vous l'etes.")
     }
 
     // =================== PATH ===================
@@ -1607,7 +1711,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val raw = runAStar(s, e)
                 if (raw.size < 2) {
                     Log.w(TAG, "A* returned empty/too short path")
-                    runOnUiThread { Toast.makeText(this, "A* no path", Toast.LENGTH_LONG).show() }
+                    showToast("A* no path", Toast.LENGTH_LONG)
                     return@execute
                 }
 
@@ -1615,7 +1719,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val computed = smoothPath(raw)
                 if (computed.size < 2) {
                     Log.w(TAG, "Smoothed path too short")
-                    runOnUiThread { Toast.makeText(this, "Path invalid", Toast.LENGTH_LONG).show() }
+                    showToast("Path invalid", Toast.LENGTH_LONG)
                     return@execute
                 }
 
@@ -1682,8 +1786,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 turnEvents = turns
                 nextTurnIdx = 0
                 turnLockActive = false
+                turnDirSign = 0
+                turnGyroZLp = 0f
+                turnGyroHoldMs = 0L
+                turnGyroAccumRad = 0f
+                turnStartTsNs = 0L
+                turnLastTsNs = 0L
+                turnVibeDone = false
                 lockOkCount = 0
                 pendingStepsWhileLocked = 0
+                turnLockSuppressed = false
+                turnLockSuppressUntilDistPx = 0f
 
                 // 7) Send to Matlab + UI
                 sendPathToMatlab(computed)
@@ -1692,15 +1805,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 stepDetectionEnabled = true
 
                 runOnUiThread {
-                    Toast.makeText(
-                        this,
+                    showToast(
                         "A* ready: %.1fpx (%.1fm), steps=$totalSteps".format(
                             Locale.US,
                             totalPx,
                             distanceM
-                        ),
-                        Toast.LENGTH_SHORT
-                    ).show()
+                        )
+                    )
                     draw()
                 }
 
@@ -1712,7 +1823,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
             } catch (t: Throwable) {
                 Log.e(TAG, "computePath(A*) error", t)
-                runOnUiThread { Toast.makeText(this, "Error path", Toast.LENGTH_LONG).show() }
+                showToast("Error path", Toast.LENGTH_LONG)
             }
         }
     }
@@ -1777,6 +1888,27 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 val gz = e.values[2]
                 gyroZFiltered = (1f - gyroZAlpha) * gyroZFiltered + gyroZAlpha * gz
                 lastGyroZ = gyroZFiltered
+
+                if (turnLockActive) {
+                    val ts = e.timestamp // ns
+
+                    if (turnStartTsNs == 0L) {
+                        turnStartTsNs = ts
+                        turnLastTsNs = ts
+                        Log.i(TAG, "TURN LOCK gyro stream started tsNs=$ts")
+                        return
+                    }
+
+                    val dtNs = ts - turnLastTsNs
+                    turnLastTsNs = ts
+                    if (dtNs <= 0L) return
+
+                    updateDuringTurnLockTs(ts, dtNs, gz)
+                } else {
+                    turnStartTsNs = 0L
+                    turnLastTsNs = 0L
+                }
+
                 return
             }
 
@@ -1794,90 +1926,161 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
 
             Sensor.TYPE_ACCELEROMETER -> {
+                if (turnLockActive) return
+
                 val ax = e.values[0]
                 val ay = e.values[1]
                 val az = e.values[2]
                 val filtMag = updateAccelFilters(e.timestamp, ax, ay, az)
                 if (calibActive) {
                     if (!stepDetectionEnabled) return
+
                     val nowMs = e.timestamp / 1_000_000L
-
-                    val amp = abs(filtMag)
-                    val (mu, sd) = updateAccelStatsRobust(amp)
-                    // Calibration: marche lente => seuil adaptatif moins agressif.
-                    // On garde ton plancher calibThreshMin (=1.2) mais on baisse K et z.
-                    val k = calibStepThreshK
-                    val zMin = calibStepZMin
-                    val thresh = max(calibThreshMin, mu + k * sd)
-                    val z = if (sd > calibMinStd) (amp - mu) / sd else 0f
-
-                    val okDelay = nowMs - calibLastPeakMs >= calibMinPeakIntervalMs
-                    val peakOk = (amp >= thresh) && (z >= zMin)
-                    if (DBG) {
-                        udpSendLine(
-                            "DBG_CALIB,amp=%.3f,th=%.3f,mu=%.3f,sd=%.3f,z=%.2f,delay=%d,okDelay=%b,peakOk=%b,armed=%b"
-                                .format(
-                                    Locale.US,
-                                    amp,
-                                    thresh,
-                                    mu,
-                                    sd,
-                                    z,
-                                    nowMs - calibLastPeakMs,
-                                    okDelay,
-                                    peakOk,
-                                    calibPeakArmed
-                                )
-                        )
-                    }
-                    if (DBG && calibPeakArmed) {
-                        if (!okDelay && peakOk) {
-                            udpSendLine(
-                                "DBG_CALIB_REJECT,reason=delay,amp=%.3f,th=%.3f,z=%.2f,delay=%d"
-                                    .format(Locale.US, amp, thresh, z, nowMs - calibLastPeakMs)
-                            )
-                        } else if (okDelay && !peakOk) {
-                            udpSendLine(
-                                "DBG_CALIB_REJECT,reason=thresh,amp=%.3f,th=%.3f,mu=%.3f,sd=%.3f,z=%.2f"
-                                    .format(Locale.US, amp, thresh, mu, sd, z)
-                            )
-                        }
-                    }
-
-                    if (calibPeakArmed && okDelay && peakOk) {
-                        calibStepCount++
-                        calibStepTimes.add(nowMs)
-                        calibStepAmps.add(amp)
-                        calibPeakArmed = false
-                        calibLastPeakMs = nowMs
-
-                        runOnUiThread {
-                            introStats.text =
-                                "Enregistrement en cours…\nMarchez normalement. Pas détectés : $calibStepCount"
-                        }
-
+                    val absCurr = abs(filtMag)
+                    if (nowMs - calibLastDbgMs >= 200L) {
+                        calibLastDbgMs = nowMs
                         Log.i(
                             TAG,
-                            "CALIB STEP $calibStepCount amp=%.2f th=%.2f mu=%.2f sd=%.2f z=%.2f"
-                                .format(Locale.US, amp, thresh, mu, sd, z)
+                            "CALIB DBG absCurr=%.3f absLast=%.3f armed=%b thresh=%.2f"
+                                .format(Locale.US, absCurr, abs(lastFilt), calibPeakArmed, calibAmpThresh)
                         )
-                    } else if (amp < 0.7f * thresh || (nowMs - calibLastPeakMs) > (calibMinPeakIntervalMs * 18L / 10L)) {
-                        // ré-armement quand on retombe bien en dessous
-                        calibPeakArmed = true
-                        if (DBG) {
-                            udpSendLine(
-                                "DBG_CALIB_REARM,amp=%.3f,th=%.3f,delay=%d"
-                                    .format(Locale.US, amp, thresh, nowMs - calibLastPeakMs)
-                            )
+                    }
+
+                    // IMPORTANT: on utilise un pic = maximum local sur |signal|
+                    val absLast = abs(lastFilt)
+                    val absPrev = abs(prevFilt)
+                    val isLocalMax = (absLast >= absPrev && absLast >= absCurr)
+
+                    if (isLocalMax) {
+                        val dt = if (calibLastAnyPeakMs == 0L) 0L else (nowMs - calibLastAnyPeakMs)
+                        val okPolarity = lastFilt > 0f
+                        val okCandidateAmp = absLast >= calibCandidateMinAmp
+
+                        if (calibPeakArmed && okPolarity && okCandidateAmp) {
+                            calibHasPeakCandidate = true
+                            calibPeakCandidateAmp = absLast
+                            calibPeakCandidateTimeMs = nowMs
+                            calibPeakCandidateDtMs = dt
+                            calibPeakArmed = false
+                            calibLastAnyPeakMs = nowMs
                         }
                     }
+
+                    // Fenetre du pic: uniquement partie positive du signal
+                    if (filtMag > 0f) {
+                        if (calibPosLobeStartMs == 0L) {
+                            calibPosLobeStartMs = nowMs
+                        }
+                    } else if (calibPosLobeStartMs != 0L) {
+                        val widthMs = nowMs - calibPosLobeStartMs
+                        if (calibHasPeakCandidate) {
+                            val widthOk = widthMs in calibPeakWidthAcceptMs..calibPeakWidthMaxMs
+                            val widthReject = widthMs < calibPeakWidthRejectMs || widthMs > calibPeakWidthMaxMs
+                            val okAmp =
+                                calibPeakCandidateAmp in calibAmpThresh..calibAmpMax
+                            val okDt = if (calibPeakCandidateDtMs == 0L) true
+                            else (calibPeakCandidateDtMs in calibMinDtMs..calibMaxDtMs)
+
+                            if (widthOk && !widthReject && okAmp && okDt) {
+                                calibStepCount++
+                                calibStepTimes.add(calibPeakCandidateTimeMs)
+                                calibStepAmps.add(calibPeakCandidateAmp)
+
+                                calibLastPeakMs = calibPeakCandidateTimeMs
+
+                                runOnUiThread {
+                                    introStats.text =
+                                        "Enregistrement en cours…\n" +
+                                            "Pas détectés : $calibStepCount\n" +
+                                            "Perturbations : $calibPerturbations"
+                                }
+                                Log.i(
+                                    TAG,
+                                    "CALIB STEP step=%d amp=%.3f dt=%dms width=%dms"
+                                        .format(
+                                            Locale.US,
+                                            calibStepCount,
+                                            calibPeakCandidateAmp,
+                                            calibPeakCandidateDtMs,
+                                            widthMs
+                                        )
+                                )
+
+                                if (DBG) {
+                                    udpSendLine(
+                                        "DBG_CALIB2,ACCEPT,amp=%.3f,dt=%d,width=%d,steps=%d,pert=%d"
+                                            .format(
+                                                Locale.US,
+                                                calibPeakCandidateAmp,
+                                                calibPeakCandidateDtMs,
+                                                widthMs,
+                                                calibStepCount,
+                                                calibPerturbations
+                                            )
+                                    )
+                                }
+                            } else {
+                                val countPert = calibPeakCandidateAmp >= calibPertMinAmp
+                                if (countPert) {
+                                    calibPerturbations++
+                                }
+                                Log.i(
+                                    TAG,
+                                    "CALIB PERT pert=%d amp=%.3f dt=%dms width=%dms okAmp=%b okDt=%b counted=%b"
+                                        .format(
+                                            Locale.US,
+                                            calibPerturbations,
+                                            calibPeakCandidateAmp,
+                                            calibPeakCandidateDtMs,
+                                            widthMs,
+                                            okAmp,
+                                            okDt,
+                                            countPert
+                                        )
+                                )
+                                runOnUiThread {
+                                    introStats.text =
+                                        "Enregistrement en cours…\n" +
+                                            "Pas détectés : $calibStepCount\n" +
+                                            "Perturbations : $calibPerturbations"
+                                }
+                                if (DBG) {
+                                    udpSendLine(
+                                        "DBG_CALIB2,REJECT,amp=%.3f,dt=%d,width=%d,okAmp=%b,okDt=%b,pert=%d"
+                                            .format(
+                                                Locale.US,
+                                                calibPeakCandidateAmp,
+                                                calibPeakCandidateDtMs,
+                                                widthMs,
+                                                okAmp,
+                                                okDt,
+                                                calibPerturbations
+                                            )
+                                    )
+                                }
+                            }
+                        }
+
+                        calibPosLobeStartMs = 0L
+                        calibHasPeakCandidate = false
+                        calibPeakCandidateAmp = 0f
+                        calibPeakCandidateTimeMs = 0L
+                        calibPeakCandidateDtMs = 0L
+                        calibPeakArmed = true
+                    }
+
+                    // IMPORTANT: mise à jour mémoire (sinon localMax ne marche pas)
+                    prevFilt = lastFilt
+                    lastFilt = filtMag
+
                     return
                 }
                 // navigation: pas detectes seulement si navigation active (READY ou RUNNING)
                 if (!navigationActive) return
+                if (navPaused) return
                 if (!stepDetectionEnabled) return
 
-                if (detectStepFromAccel(filtMag, e.timestamp)) {
+                if (detectStepFromPeakNav(filtMag, e.timestamp)) {
                     val nowMs = e.timestamp / 1_000_000L
 
                     rawStepCount++
@@ -1930,6 +2133,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                             }
                         }
 
+                        navPaused = false
+                        resetNavStepDetectionState()
                         navState = NavState.RUNNING
                         udpSendLine("CTRL,START")
                         Log.i(TAG, "STATE -> RUNNING")
@@ -2056,59 +2261,47 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 lastTurnHintStage = 0
             }
             val dir = dirFr(nextInfo.dir)
-            if (nextInfo.distM <= 6f && lastTurnHintStage < 1) {
+            if (nextInfo.distM <= 1.0f && lastTurnHintStage < 1) {
                 showTurnHint("Tournez a $dir dans %.1f m".format(Locale.US, nextInfo.distM))
-                vibrate(60)
-                lastTurnHintStage = 1
-            }
-            if (nextInfo.distM <= 1.2f && lastTurnHintStage < 2) {
-                showTurnHint("Arrivee virage: $dir")
                 vibrate(120)
-                lastTurnHintStage = 2
-            }
-            if (nextInfo.distM <= 0.5f && lastTurnHintStage < 3) {
-                showTurnHint("Tournez a $dir maintenant")
-                vibrate(220)
-                lastTurnHintStage = 3
+                lastTurnHintStage = 1
             }
         }
 
-        // 1) dÃ©clenchement lock virage par distance
+        // 1) declenchement lock virage par distance
         val turns = turnEvents
         if (!turnLockActive && nextTurnIdx < turns.size) {
             val ev = turns[nextTurnIdx]
-            if (distNowPx >= ev.atDistPx - lookAheadPx) {
-                turnLockActive = true
+
+            // 1) vibration 1m avant = deja geree plus haut via nextInfo.distM <= 1.0f
+
+            // 2) lock SEULEMENT quand on arrive au point du virage (~20 cm avant)
+            if (turnLockSuppressed && distNowPx >= turnLockSuppressUntilDistPx) {
+                turnLockSuppressed = false
+            }
+            if (turnLockSuppressed) return
+            if (distNowPx >= ev.atDistPx - turnLockLeadPx) {
                 turnLockDir = ev.dir
                 pendingStepsWhileLocked = 0
 
-                udpSendLine("TURN,${ev.dir}")
-                vibrate(250)
+                // Cible du nouveau segment (relatif)
+                turnLockTargetRel = absToRelMap(ev.newHeadingAbs)
 
-                Log.i(TAG, "TURN LOCK ON dir=${ev.dir}")
+                // init lock state
+                lockOkCount = 0
+                lockGyroOkCount = 0
+                turnGyroPhase = 0
+                turnGyroStableCount = 0
+                lockMaxYawErrDeg = 0f
+                turnSawLargeErr = false
+
+                startTurnLock(dirRight = ev.dir == "RIGHT")
+                udpSendLine("TURN,${ev.dir}")
             }
         }
 
         // 2) validation par gyro Z
         if (turnLockActive) {
-            when (turnLockDir) {
-                "RIGHT" -> {
-                    if (lastGyroZ < -gyroZTurnThreshold) {
-                        validateTurn()
-                        return
-                    } else {
-                        udpSendLine("TURN,RIGHT")
-                    }
-                }
-                "LEFT" -> {
-                    if (lastGyroZ > gyroZTurnThreshold) {
-                        validateTurn()
-                        return
-                    } else {
-                        udpSendLine("TURN,LEFT")
-                    }
-                }
-            }
             return
         } else {
             udpSendLine("TURN,OK")
@@ -2118,7 +2311,150 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (ratioNow >= 0.995f) navCompleted()
     }
 
+    private fun startTurnLock(dirRight: Boolean) {
+        turnLockActive = true
+        turnDirSign = if (dirRight) +1 else -1
+
+        turnGyroZLp = 0f
+        turnGyroHoldMs = 0L
+        turnGyroAccumRad = 0f
+        turnStartTsNs = 0L
+        turnLastTsNs = 0L
+
+        turnGyroPhase = 0 // 0: waiting opposite lobe, 1: waiting correct lobe
+        turnGyroStableCount = 0
+
+        turnVibeDone = false
+
+        if (!turnVibeDone) {
+            vibrateOnceShort()
+            turnVibeDone = true
+        }
+
+        Log.i(
+            TAG,
+            "TURN LOCK ON dir=${if (dirRight) "RIGHT" else "LEFT"} sign=$turnDirSign " +
+                "needDeg=$GYRO_TURN_DEG_MIN rateMin=$GYRO_RATE_MIN holdMs=$GYRO_HOLD_MS"
+        )
+    }
+
+    private fun updateDuringTurnLockTs(tsNs: Long, dtNs: Long, gyroZRaw: Float) {
+        if (!turnLockActive) return
+
+        // LP filter
+        turnGyroZLp = 0.88f * turnGyroZLp + 0.12f * gyroZRaw
+
+        val dtSec = dtNs.toFloat() * 1e-9f
+        val ageMs = (tsNs - turnStartTsNs) / 1_000_000L
+
+        // gyro in expected direction (dir-normalized)
+        val gyroDir = turnGyroZLp * turnDirSign
+
+        // phase detector:
+        // For RIGHT (dirSign=+1): we often see a negative pre-lobe => gyroDir < 0
+        // For LEFT  (dirSign=-1): symmetric.
+        val preLobeSeen = gyroDir < -0.12f
+        if (turnGyroPhase == 0 && preLobeSeen) {
+            turnGyroPhase = 1
+            Log.i(
+                TAG,
+                "TURN LOCK phase1: pre-lobe seen gyroDir=%.3f gzLp=%.3f"
+                    .format(Locale.US, gyroDir, turnGyroZLp)
+            )
+        }
+
+        // accept condition is based on POSITIVE gyroDir (correct direction)
+        val gyroOk = gyroDir > GYRO_RATE_MIN
+
+        if (gyroOk) {
+            turnGyroHoldMs += (dtNs / 1_000_000L)
+            // integrate ONLY correct direction so opposite lobe doesn't cancel
+            turnGyroAccumRad += gyroDir * dtSec
+        } else {
+            // soft decay (keeps responsiveness but avoids noise)
+            turnGyroHoldMs = (turnGyroHoldMs * 0.6f).toLong()
+            turnGyroAccumRad *= 0.90f
+        }
+
+        val turnedDeg = (turnGyroAccumRad * 57.29578f) // already positive-ish because gyroDir integrated
+        val needDeg = GYRO_TURN_DEG_MIN
+        val remainDeg = (needDeg - turnedDeg).coerceAtLeast(0f)
+
+        val accept =
+            (ageMs >= TURN_MIN_LOCK_MS) &&
+                (turnGyroPhase >= 1 || ageMs >= 260L) && // phase optional: after 260ms we don't require pre-lobe
+                (turnGyroHoldMs >= GYRO_HOLD_MS) &&
+                (turnedDeg >= needDeg)
+
+        val timeout = ageMs > TURN_MAX_LOCK_MS
+
+        // logs throttled
+        val nowWall = System.currentTimeMillis()
+        if (nowWall - turnDbgLastMs > 150L) {
+            turnDbgLastMs = nowWall
+            Log.i(
+                TAG,
+                "TURN LOCK dbg age=${ageMs}ms phase=$turnGyroPhase " +
+                    "gzRaw=%.3f gzLp=%.3f dir=%+.0f gyroDir=%.3f ok=%b hold=${turnGyroHoldMs}ms " +
+                    "turned=%.1fdeg need=%.1fdeg rem=%.1fdeg"
+                    .format(
+                        Locale.US,
+                        gyroZRaw,
+                        turnGyroZLp,
+                        turnDirSign.toFloat(),
+                        gyroDir,
+                        gyroOk,
+                        turnedDeg,
+                        needDeg,
+                        remainDeg
+                    )
+            )
+            // utile aussi via UDP si tu veux
+            udpSendLine(
+                "DBG_TURN,age=$ageMs,phase=$turnGyroPhase,gzRaw=%.3f,gzLp=%.3f,gyroDir=%.3f,hold=%d,turned=%.1f,need=%.1f"
+                    .format(
+                        Locale.US,
+                        gyroZRaw,
+                        turnGyroZLp,
+                        gyroDir,
+                        turnGyroHoldMs,
+                        turnedDeg,
+                        needDeg
+                    )
+            )
+        }
+
+        if (accept || timeout) {
+            Log.i(
+                TAG,
+                "TURN VALIDATED accept=$accept timeout=$timeout age=${ageMs}ms phase=$turnGyroPhase " +
+                    "hold=${turnGyroHoldMs}ms turned=%.1fdeg gzLp=%.3f"
+                    .format(Locale.US, turnedDeg, turnGyroZLp)
+            )
+
+            turnLockActive = false
+            advanceToNextSegment()
+        }
+    }
+
+    private fun advanceToNextSegment() {
+        validateTurn()
+    }
+
     private fun validateTurn() {
+        turnGyroAngleDeg = 0f
+        turnDirSign = 0
+        turnGyroZLp = 0f
+        turnGyroHoldMs = 0L
+        turnGyroAccumRad = 0f
+        turnStartTsNs = 0L
+        turnLastTsNs = 0L
+        turnVibeDone = false
+        lockOkCount = 0
+        lockGyroOkCount = 0
+        turnSawLargeErr = false
+        lockMaxYawErrDeg = 0f
+        turnLockStartMs = 0L
         turnLockActive = false
         nextTurnIdx++
 
@@ -2138,6 +2474,90 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
     }
 
+    private fun updateTurnLockByGyro(): Boolean {
+        // 1) securite timeout (evite blocage infini)
+        val nowMs = System.currentTimeMillis()
+        if (turnLockStartMs != 0L && nowMs - turnLockStartMs > lockTimeoutMs) {
+            // si on est aligne, on valide; sinon on relache (fail-safe) pour ne pas rester bloque
+            val yawRel = getYawFiltered()
+            val err = abs(angleErrorDeg(turnLockTargetRel, yawRel))
+            if (err < turnYawAcceptDeg) {
+                validateTurn()
+                return true
+            } else {
+                Log.w(TAG, "TURN LOCK TIMEOUT -> release (err=%.1f)".format(Locale.US, err))
+                turnLockActive = false
+                pendingStepsWhileLocked = 0
+                turnLockSuppressed = true
+                turnLockSuppressUntilDistPx = distNowPx + max(stepLenPxNav(), turnLockLeadPx)
+                udpSendLine("TURN,OK")
+                vibrate(80)
+                return true
+            }
+        }
+
+        // 2) condition d'alignement yaw (OBLIGATOIRE pour valider)
+        val yawRel = getYawFiltered()
+        val errSigned = angleErrorDeg(turnLockTargetRel, yawRel)
+        val errAbs = abs(errSigned)
+
+        lockMaxYawErrDeg = max(lockMaxYawErrDeg, errAbs)
+        if (lockMaxYawErrDeg >= lockMinErrToRequireTurn) turnSawLargeErr = true
+
+        val stableGyro = abs(lastGyroZ) < gyroZStableThreshold
+
+        // 3) "vrai virage" : soit angle gyro accumule, soit yaw a vraiment decroche
+        val turnedEnoughByGyro = abs(turnGyroAngleDeg) >= minTurnAngleFromGyroDeg
+        val turnedEnough = turnedEnoughByGyro || turnSawLargeErr
+
+        // ---- NOUVEAU: validation "gyro-only" (yaw peut etre gele si telephone vertical) ----
+        // On exige: gyro stable + rotation integree suffisante + signe coherent avec LEFT/RIGHT
+        val dirOk = when (turnLockDir) {
+            "LEFT" -> turnGyroAngleDeg <= -minTurnAngleFromGyroDeg
+            "RIGHT" -> turnGyroAngleDeg >= minTurnAngleFromGyroDeg
+            else -> turnedEnoughByGyro
+        }
+        if (stableGyro && turnedEnoughByGyro && dirOk) {
+            lockGyroOkCount++
+            if (lockGyroOkCount >= lockGyroOkNeeded) {
+                // Recalage yaw sur la cible pour repartir propre apres validation
+                val yawAbsSmooth = getYawSmoothAbsDegOrNull()
+                if (yawAbsSmooth != null) {
+                    yawSmoothPrevDeg = yawAbsSmooth
+                    yawAbsContDeg = yawAbsSmooth
+                    yawOffsetContDeg = yawAbsContDeg - turnLockTargetRel
+                    yawFiltered = turnLockTargetRel
+                    yawInit = true
+                    lastYawTime = System.currentTimeMillis()
+                    yawOffsetLockedToPath = true
+                }
+                validateTurn()
+                return true
+            }
+        } else {
+            lockGyroOkCount = 0
+        }
+
+        // 4) validation = alignement yaw proche + gyro stable quelques ticks + turnedEnough
+        if (errAbs < turnYawAcceptDeg && stableGyro && turnedEnough) {
+            lockOkCount++
+            if (lockOkCount >= lockOkNeeded) {
+                validateTurn()
+                return true
+            }
+        } else {
+            lockOkCount = 0
+        }
+
+        // debug UDP
+        udpSendLine(
+            "TURN,LOCK,dir=$turnLockDir,err=%.1f,gz=%.3f,gyroDeg=%.1f,ok=%d,seen=%b"
+                .format(Locale.US, errSigned, lastGyroZ, turnGyroAngleDeg, lockOkCount, turnedEnough)
+        )
+
+        return false
+    }
+
     private fun navCompleted() {
         navState = NavState.FINISHED
         navigationActive = false
@@ -2146,7 +2566,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         closeCsvLogger()
         vibrate(700)
         Log.i(TAG, "NAV COMPLETED")
-        runOnUiThread { Toast.makeText(this, "You made it <3 !", Toast.LENGTH_LONG).show() }
+        showToast("You made it <3 !", Toast.LENGTH_LONG)
     }
 
     // =================== YAW FILTER (NEW: getOrientation-based) ===================
@@ -2175,7 +2595,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         // Rejet si tÃ©lÃ©phone trop "vertical" -> yaw devient instable (marche/poches)
         // Ici on fait simple: si pitch trop proche de +/-90 (ou trop fort), on garde la derniÃ¨re valeur.
-        if (abs(pitchDeg) > 70f) return yawFiltered
+        // Hors virage locke: on rejette les poses trop verticales.
+        // Pendant un lock de virage: on laisse passer (sinon yaw reste fige => jamais de delock).
+        if (!turnLockActive && abs(pitchDeg) > 70f) return yawFiltered
 
         var yawRawDeg = normalizeAngle(yawRawDeg0)
         if (INVERT_YAW) yawRawDeg = -yawRawDeg
@@ -2275,7 +2697,34 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
 
+    private fun resetNavStepDetectionState() {
+        navPeakArmed = true
+        navPosLobeStartMs = 0L
+        navHasPeakCandidate = false
+        navPeakCandidateAmp = 0f
+        navPeakCandidateTimeMs = 0L
+        navPeakCandidateDtMs = 0L
+        navLastAnyPeakMs = 0L
+        prevFilt = 0f
+        lastFilt = 0f
+    }
+
+    private fun onStepAccepted(nowMs: Long) {
+        if (turnLockActive) return
+
+        if (lastAcceptedStepMs != 0L) {
+            val dt = (nowMs - lastAcceptedStepMs).coerceIn(250L, 2000L)
+            dtStepMs = dt
+            val dtF = dt.toFloat()
+            stepPeriodMs = 0.85f * stepPeriodMs + 0.15f * dtF
+            Log.i("NAVAPP", "STEP PERIOD dtStepMs=$dt stepPeriodMs=${stepPeriodMs.toInt()}")
+        }
+        lastAcceptedStepMs = nowMs
+    }
+
     private fun detectStepFromAccel(filt: Float, tsNs: Long): Boolean {
+        if (turnLockActive) return false
+
         val nowMs = tsNs / 1_000_000L
 
         // Refractory dynamique (cadence)
@@ -2307,7 +2756,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // Detection de pic LOCAL sur |signal| (pas besoin de zero-cross)
         val localMaxAbs = (absLast >= absPrev && absLast >= absCurr)
 
-        val sinceLast = nowMs - lastStepAcceptedMs
+        val sinceLast = nowMs - lastAcceptedStepMs
         val passThresh = (absLast > thresh || prominenceOk)
         val accept = localMaxAbs && sinceLast > dynMinDelayMs && passThresh
         if (DBG && localMaxAbs && !accept) {
@@ -2329,14 +2778,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (accept) {
 
             // update periode
-            if (lastStepAcceptedMs != 0L) {
-                dtStepMs = nowMs - lastStepAcceptedMs
-                val dt = dtStepMs.toFloat()
-                val dtClamped = dt.coerceIn(stepPeriodMinMs, stepPeriodMaxMs)
-                stepPeriodMs = (1f - stepPeriodAlpha) * stepPeriodMs + stepPeriodAlpha * dtClamped
-            }
-
-            lastStepAcceptedMs = nowMs
+            onStepAccepted(nowMs)
             lastStepTimeMs = nowMs
 
             // memorise amplitude pour limiter la stats update plus haut
@@ -2358,6 +2800,149 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return false
     }
 
+    private fun detectStepFromPeakNav(filt: Float, tsNs: Long): Boolean {
+        if (turnLockActive) return false
+
+        val nowMs = tsNs / 1_000_000L
+        val absCurr = abs(filt)
+        val absLast = abs(lastFilt)
+        val absPrev = abs(prevFilt)
+
+        val ampMin = (stepAmpRefUser * 0.6f).coerceAtLeast(0.5f)
+        val ampMax = (stepAmpRefUser * 1.6f).coerceAtLeast(ampMin + 0.01f)
+        val minDt = max(200L, (stepRefPeriodMsUser * 0.55f).toLong())
+        val maxDt = min(3000L, (stepRefPeriodMsUser * 1.70f).toLong())
+
+        val isLocalMax = (absLast >= absPrev && absLast >= absCurr)
+        if (isLocalMax) {
+            val dt = if (navLastAnyPeakMs == 0L) 0L else (nowMs - navLastAnyPeakMs)
+            val okPolarity = lastFilt > 0f
+            val okCandidateAmp = absLast >= ampMin
+
+            if (navPeakArmed && okPolarity && okCandidateAmp) {
+                navHasPeakCandidate = true
+                navPeakCandidateAmp = absLast
+                navPeakCandidateTimeMs = nowMs
+                navPeakCandidateDtMs = dt
+                navPeakArmed = false
+                navLastAnyPeakMs = nowMs
+            }
+        }
+
+        if (filt > 0f) {
+            if (navPosLobeStartMs == 0L) {
+                navPosLobeStartMs = nowMs
+            }
+        } else if (navPosLobeStartMs != 0L) {
+            val widthMs = nowMs - navPosLobeStartMs
+            if (navHasPeakCandidate) {
+                val widthOk = widthMs in calibPeakWidthAcceptMs..calibPeakWidthMaxMs
+                val widthReject = widthMs < calibPeakWidthRejectMs || widthMs > calibPeakWidthMaxMs
+                val okAmp = navPeakCandidateAmp in ampMin..ampMax
+                val okDt = if (navPeakCandidateDtMs == 0L) true
+                else (navPeakCandidateDtMs in minDt..maxDt)
+
+                if (widthOk && !widthReject && okAmp && okDt) {
+                    onStepAccepted(nowMs)
+                    lastStepTimeMs = nowMs
+                    lastStepAmpAbs = navPeakCandidateAmp.coerceAtLeast(0.05f)
+                    peakAbsHold = navPeakCandidateAmp
+                    Log.i(
+                        TAG,
+                        "NAV STEP amp=%.3f dt=%dms width=%dms refT=%.0fms ampRef=%.3f"
+                            .format(
+                                Locale.US,
+                                navPeakCandidateAmp,
+                                navPeakCandidateDtMs,
+                                widthMs,
+                                stepRefPeriodMsUser,
+                                stepAmpRefUser
+                            )
+                    )
+                    prevFilt = lastFilt
+                    lastFilt = filt
+                    return true
+                }
+            }
+
+            navPosLobeStartMs = 0L
+            navHasPeakCandidate = false
+            navPeakCandidateAmp = 0f
+            navPeakCandidateTimeMs = 0L
+            navPeakCandidateDtMs = 0L
+            navPeakArmed = true
+        }
+
+        prevFilt = lastFilt
+        lastFilt = filt
+        return false
+    }
+
+    private fun startCalibrationIfReady() {
+        if (!calibWaitingStart) return
+
+        calibWaitingStart = false
+        calibActive = true
+        stepDetectionEnabled = true   // pas actifs UNIQUEMENT apres COMMENCER
+        calibStepCount = 0
+        calibStepTimes.clear()
+        calibStepAmps.clear()
+        calibLastPeakMs = 0L
+        calibPeakArmed = true
+        calibPerturbations = 0
+        calibPosLobeStartMs = 0L
+        calibHasPeakCandidate = false
+        calibPeakCandidateAmp = 0f
+        calibPeakCandidateTimeMs = 0L
+        calibPeakCandidateDtMs = 0L
+        calibLastAnyPeakMs = 0L
+        calibStopButton.visibility = View.VISIBLE
+
+        // IMPORTANT: reset stats pour seuil adaptatif etalonnage (evite pollution)
+        accelWinCount = 0
+        accelWinIdx = 0
+        accelSum = 0f
+        accelSumSq = 0f
+
+        introStats.text =
+            "Enregistrement en cours...\n" +
+            "Marchez normalement. Pas detectes : 0"
+
+        Log.i(TAG, "CALIB START")
+    }
+
+    private fun resetCalibrationToReady(message: String = "Pret(e) quand vous l'etes.") {
+        calibActive = false
+        calibWaitingStart = true
+        stepDetectionEnabled = false
+        calibStepCount = 0
+        calibStepTimes.clear()
+        calibStepAmps.clear()
+        calibLastPeakMs = 0L
+        calibPeakArmed = true
+        calibPerturbations = 0
+        calibPosLobeStartMs = 0L
+        calibHasPeakCandidate = false
+        calibPeakCandidateAmp = 0f
+        calibPeakCandidateTimeMs = 0L
+        calibPeakCandidateDtMs = 0L
+        calibLastAnyPeakMs = 0L
+
+        // reset stats pour seuil adaptatif
+        accelWinCount = 0
+        accelWinIdx = 0
+        accelSum = 0f
+        accelSumSq = 0f
+
+        runOnUiThread {
+            calibStopButton.visibility = View.GONE
+            calibButton.visibility = View.VISIBLE
+            calibButton.text = "COMMENCER"
+            calibButton.setOnClickListener { startCalibrationIfReady() }
+            introStats.text = message
+        }
+    }
+
     private fun finishCalibrationWithDistance() {
         calibActive = false
         calibWaitingStart = false
@@ -2366,11 +2951,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (calibStepCount <= 0) return
 
         if (calibStepCount !in 5..12) {
-            Toast.makeText(
-                this,
+            showToast(
                 "Étalonnage invalide ($calibStepCount pas détectés).\nRefaites la marche de 5 m.",
                 Toast.LENGTH_LONG
-            ).show()
+            )
             Log.w(TAG, "CALIB REJECT steps=$calibStepCount")
             calibWaitingStart = true
             calibButton.visibility = View.VISIBLE
@@ -2403,11 +2987,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             dtRefRaw
         }
         if (dtRef > calibMaxRefPeriodMs) {
-            Toast.makeText(
-                this,
+            showToast(
                 "Etalonnage invalide (pauses ou marche trop lente).\nRefaites les 5 m d'un seul trait.",
                 Toast.LENGTH_LONG
-            ).show()
+            )
             Log.w(TAG, "CALIB REJECT dtRef=%.0fms".format(Locale.US, dtRef))
             calibWaitingStart = true
             calibButton.visibility = View.VISIBLE
@@ -2469,7 +3052,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         runOnUiThread {
             introStats.text =
-                "Mesures terminées ✅\n\n" +
+                "Mesures terminées ?\n\n" +
                 "• Pas détectés : $calibStepCount\n" +
                 "• Longueur de pas : %.2f m\n".format(Locale.US, stepLenMUser) +
                 "• Cadence : %.0f pas/min\n".format(Locale.US, cadenceSpm) +
@@ -2491,7 +3074,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             if (mapReady) {
                 requestDraw()
             } else {
-                Toast.makeText(this, "Préparation de la carte…", Toast.LENGTH_SHORT).show()
+                showToast("Préparation de la carte…")
             }
         }
 
@@ -3386,6 +3969,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     // =================== VIBRATE ===================
+    private fun vibrateOnceShort() {
+        vibrate(120)
+    }
+
     private fun vibrate(duration: Long) {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -3576,3 +4163,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
     }
 }
+
+
+
