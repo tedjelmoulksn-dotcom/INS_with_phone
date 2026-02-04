@@ -304,7 +304,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val calibAmpThresh = 1.2f          // amplitude fixe (post-filtrage)
     private val calibAmpMax =5f             // amplitude max pour un pas
     private val calibCandidateMinAmp = 1.2f    // candidats seulement au-dessus de 1.2
-    private val calibPertMinAmp = 1.7f         // perturbations comptées seulement >= 1.7
+    private val calibPertMinAmp = 1.7f         // perturbations compt?es seulement >= 1.7
     private val calibMinDtMs = 450L            // bruit si < 0.45 s
     private val calibMaxDtMs = 3200L           // cadence lente
     private val calibRearmRatio = 0.50f        // rearm quand on redescend sous 50% du seuil
@@ -330,6 +330,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var stepRefLenMUser = STEP_LEN_M
     private var stepLenMUser = STEP_LEN_M
     private var stepLenNavM = STEP_LEN_M
+
+    // --- VIBRATION COOLDOWN (avoid double buzz) ---
+    private var lastVibeMs: Long = 0L
+    private val VIBE_COOLDOWN_MS = 450L
+
+    private fun vibeOnce(ms: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastVibeMs >= VIBE_COOLDOWN_MS) {
+            vibrate(ms)
+            lastVibeMs = now
+        }
+    }
     private val PREFS_NAME = "calibration_prefs"
     private val PREF_STEP_LEN_M = "pref_step_len_m"
     private val PREF_STEP_REF_PERIOD_MS = "pref_step_ref_period_ms"
@@ -452,7 +464,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         //totalDistPx <= 0f : distance totale invalide (path vide ou bug).
         // Si une condition est vraie : on ne peut pas calibrer ? false.
         val maxSeg = path.size - 2
-        val segIdx = findSegmentIndexByDistance(cd, distNowPx).coerceIn(0, maxSeg)
+        // Use monotone distance along path to avoid jitter/early locks
+        val distForLogicPx = distAlongPx
+        distNowPx = distAlongPx
+        ratioNow = if (totalDistPx > 0f) {
+            (distAlongPx / totalDistPx).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+
+        val segIdx = findSegmentIndexByDistance(cd, distForLogicPx).coerceIn(0, maxSeg)
      //   Un path de N points a N-1 segments : segment 0 = (0?1), segment 1 = (1?2), etc.
 
      //   maxSeg = path.size - 2 : index maximum possible pour segIdx car on accède à segIdx + 1.
@@ -738,7 +759,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
 
         introTitle = TextView(this).apply {
-            text = "Étalonnage de marche (5 m)"
+            text = "Etalonnage de marche (5 m)"
             setTextColor(Color.WHITE)
             textSize = 22f
             typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
@@ -749,19 +770,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             textSize = 15.5f
             gravity = Gravity.START
             text =
-                "Objectif : estimer votre longueur de pas et votre cadence à partir de l’accéléromètre.\n\n" +
-                "Consignes :\n" +
-                "• Allez à la porte d’entrée.\n" +
-                "• Appuyez sur « COMMENCER ».\n" +
-                "• Marchez normalement jusqu’au poteau à côté des panneaux d’affichage (5 m).\n" +
-                "• Arrivé(e) au poteau, appuyez sur « ARRÊT ».\n\n" +
-                "Nous détectons vos pas et calculons automatiquement la longueur de pas."
+                "Objectif : regler votre pas pour la navigation.\n\n" +
+                "Etapes :\n" +
+                "- Allez a la porte d'entree de galilee .\n" +
+                "- Appuyez sur \"COMMENCER\".\n" +
+                "- Marchez normalement jusqu'au point INS (5 m).\n" +
+                "- Au point INS, appuyez sur \"ARRET\".\n" +
+                "On calcule automatiquement votre longueur de pas."
         }
         introStats = TextView(this).apply {
             setTextColor(Color.argb(230, 190, 240, 200))
             textSize = 15.5f
             gravity = Gravity.START
-            text = "Prêt(e) quand vous l’êtes."
+            text = "Pret. Appuyez sur COMMENCER."
         }
 
         val margin = (12f * resources.displayMetrics.density).toInt()
@@ -867,11 +888,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             textSize = 12f
             maxLines = 4
             ellipsize = TextUtils.TruncateAt.END
-            text = "Choose the start, confirm, then choose the destination."
+            text = "Choisissez le depart, validez, puis choisissez la destination."
         }
         val btnTextSizeSp = 12f
         pickStartButton = Button(this).apply {
-            text = "Choose start"
+            text = "Choisir depart"
             textSize = btnTextSizeSp
             isAllCaps = false
             isLongClickable = false
@@ -882,32 +903,32 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 startConfirmed = false
                 endConfirmed = false
                 selectMode = SelectMode.PICK_START
-                showToast("Tap a start point")
+                showToast("Touchez un point de depart")
                 updateNavUi()
                 draw()
             }
         }
         confirmButton = Button(this).apply {
-            text = "Confirm"
+            text = "Valider"
             textSize = btnTextSizeSp
             isAllCaps = false
             isLongClickable = false
             setOnClickListener {
                 if (!startConfirmed) {
                     if (startPoint == null) {
-                        showToast("Pick the start first")
+                        showToast("Choisissez d'abord le depart")
                         return@setOnClickListener
                     }
                     startConfirmed = true
                     selectMode = SelectMode.NONE
-                    showToast("Start confirmed. Now pick the destination.")
+                    showToast("Depart valide. Choisissez la destination.")
                     updateNavUi()
                     draw()
                     return@setOnClickListener
                 }
                 if (startConfirmed && !endConfirmed) {
                     if (endPoint == null) {
-                        showToast("Pick the destination first")
+                        showToast("Choisissez d'abord la destination")
                         return@setOnClickListener
                     }
                     resetNavigationForSelection()
@@ -915,30 +936,30 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     selectMode = SelectMode.NONE
                     computePathAsync()
                     stepDetectionEnabled = true
-                    showToast("Destination confirmed. You can walk.")
+                    showToast("Destination validee. Vous pouvez marcher.")
                     updateNavUi()
                     return@setOnClickListener
                 }
             }
         }
         pickEndButton = Button(this).apply {
-            text = "Choose destination"
+            text = "Choisir destination"
             textSize = btnTextSizeSp
             isAllCaps = false
             isLongClickable = false
             setOnClickListener {
                 if (!startConfirmed) {
-                    showToast("Confirm the start first")
+                    showToast("Validez d'abord le depart")
                     return@setOnClickListener
                 }
                 endConfirmed = false
                 selectMode = SelectMode.PICK_END
-                showToast("Tap a destination point")
+                showToast("Touchez un point de destination")
                 updateNavUi()
             }
         }
         restartButton = Button(this).apply {
-            text = "Restart"
+            text = "Recommencer"
             textSize = btnTextSizeSp
             isAllCaps = false
             isLongClickable = false
@@ -950,26 +971,43 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 startConfirmed = false
                 endConfirmed = false
                 selectMode = SelectMode.PICK_START
-                showToast("Reset: choose a new start")
+                showToast("Reinitialise : choisissez un nouveau depart")
                 updateNavUi()
                 draw()
             }
         }
         pauseResumeButton = Button(this).apply {
-            text = "Pause"
+            text = "Commencer a marcher"
             textSize = btnTextSizeSp
             isAllCaps = false
             isLongClickable = false
             setOnClickListener {
-                if (navState != NavState.RUNNING) {
-                    showToast("Navigation pas active")
-                    return@setOnClickListener
+                when {
+                    navState == NavState.READY -> {
+                        navPaused = false
+                        stepDetectionEnabled = true
+                        resetNavStepDetectionState()
+                        showToast("Commencez a marcher")
+                        udpSendLine("CTRL,ARMED")
+                        Log.i(TAG, "NAV ARMED (READY). Waiting first step to RUNNING.")
+                        updateNavUi()
+                    }
+                    navState == NavState.RUNNING && navPaused -> {
+                        navPaused = false
+                        stepDetectionEnabled = true
+                        showToast("Navigation reprise")
+                        updateNavUi()
+                    }
+                    navState == NavState.RUNNING && !navPaused -> {
+                        navPaused = true
+                        stepDetectionEnabled = false
+                        showToast("Navigation en pause")
+                        updateNavUi()
+                    }
+                    else -> {
+                        showToast("Navigation pas active")
+                    }
                 }
-                navPaused = !navPaused
-                stepDetectionEnabled = !navPaused
-                text = if (navPaused) "Reprendre" else "Pause"
-                showToast(if (navPaused) "Navigation en pause" else "Navigation reprise")
-                updateNavUi()
             }
         }
 
@@ -1004,9 +1042,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         restartButton.setOnTouchListener(navChildTouchListener)
         pauseResumeButton.setOnTouchListener(navChildTouchListener)
         row1.addView(pickStartButton, btnLp)
+        row1.addView(pickEndButton, btnLp)
         row1.addView(confirmButton, btnLp)
 
-        row2.addView(pickEndButton, btnLp)
         row2.addView(pauseResumeButton, btnLp)
         row2.addView(restartButton, btnLp)
 
@@ -1028,28 +1066,28 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         updateNavUi()
 
         calibButton = Button(this).apply {
-            text = "START ÉTALONNAGE"
+            text = "START ?TALONNAGE"
             setOnClickListener {
                 startCalibrationIfReady()
             }
         }
         calibButton.text = "COMMENCER"
         calibStopButton = Button(this).apply {
-            text = "FIN ÉTALONNAGE"
+            text = "FIN ?TALONNAGE"
             setOnClickListener {
                 if (!calibActive) return@setOnClickListener
                 if (calibStepCount < 2) {
-                    resetCalibrationToReady("Étalonnage arrêté.")
+                    resetCalibrationToReady("?talonnage arr?t?.")
                     return@setOnClickListener
                 }
                 finishCalibrationWithDistance()
             }
         }
-        calibStopButton.text = "ARRÊT"
+        calibStopButton.text = "ARR?T"
         calibRestartButton = Button(this).apply {
             text = "RECOMMENCER"
             setOnClickListener {
-                resetCalibrationToReady("Étalonnage remis à zéro.\nAppuyez sur COMMENCER.")
+                resetCalibrationToReady("?talonnage remis ? z?ro.\nAppuyez sur COMMENCER.")
             }
         }
 
@@ -1430,7 +1468,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         setButtonEnabled(confirmButton, canConfirmStart || canConfirmEnd)
         setButtonEnabled(pickEndButton, canPickEnd)
         setButtonEnabled(restartButton, true)
-        setButtonEnabled(pauseResumeButton, navState == NavState.RUNNING)
+        setButtonEnabled(pauseResumeButton, navState == NavState.READY || navState == NavState.RUNNING)
         pauseResumeButton.visibility = View.VISIBLE
         restartButton.visibility = View.VISIBLE
 
@@ -1442,7 +1480,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             startConfirmed && !endConfirmed -> "3) Choisir l'arrivee puis valider"
             else -> "Pret: vous pouvez marcher"
         }
-        pauseResumeButton.text = if (navPaused) "Reprendre" else "Pause"
+        pauseResumeButton.text = when {
+            navState == NavState.READY -> "Commencer a marcher"
+            navPaused -> "Reprendre"
+            else -> "Pause"
+        }
         navHintText.text = "$hint\nDetection pas: $det"
     }
 
@@ -1963,6 +2005,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                             calibPeakCandidateDtMs = dt
                             calibPeakArmed = false
                             calibLastAnyPeakMs = nowMs
+                            Log.i(
+                                TAG,
+                                "CALIB PEAK cand amp=%.3f dt=%dms".format(
+                                    Locale.US,
+                                    calibPeakCandidateAmp,
+                                    calibPeakCandidateDtMs
+                                )
+                            )
                         }
                     }
 
@@ -1979,7 +2029,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                             val okAmp =
                                 calibPeakCandidateAmp in calibAmpThresh..calibAmpMax
                             val okDt = if (calibPeakCandidateDtMs == 0L) true
-                            else (calibPeakCandidateDtMs in calibMinDtMs..calibMaxDtMs)
+                                else (calibPeakCandidateDtMs in calibMinDtMs..calibMaxDtMs)
+                            val rejectFirstShortPeak = false
 
                             if (widthOk && !widthReject && okAmp && okDt) {
                                 calibStepCount++
@@ -1990,19 +2041,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
                                 runOnUiThread {
                                     introStats.text =
-                                        "Enregistrement en cours…\n" +
-                                            "Pas détectés : $calibStepCount\n" +
+                                        "Enregistrement en cours?\n" +
+                                            "Nombre d'echantillons : $calibStepCount\n" +
                                             "Perturbations : $calibPerturbations"
                                 }
                                 Log.i(
                                     TAG,
-                                    "CALIB STEP step=%d amp=%.3f dt=%dms width=%dms"
+                                    "CALIB STEP step=%d amp=%.3f dt=%dms width=%dms wOk=%b wRej=%b okAmp=%b okDt=%b firstShort=%b"
                                         .format(
                                             Locale.US,
                                             calibStepCount,
                                             calibPeakCandidateAmp,
                                             calibPeakCandidateDtMs,
-                                            widthMs
+                                            widthMs,
+                                            widthOk,
+                                            widthReject,
+                                            okAmp,
+                                            okDt,
+                                            rejectFirstShortPeak
                                         )
                                 )
 
@@ -2026,22 +2082,25 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                                 }
                                 Log.i(
                                     TAG,
-                                    "CALIB PERT pert=%d amp=%.3f dt=%dms width=%dms okAmp=%b okDt=%b counted=%b"
+                                    "CALIB PERT pert=%d amp=%.3f dt=%dms width=%dms wOk=%b wRej=%b okAmp=%b okDt=%b firstShort=%b counted=%b"
                                         .format(
                                             Locale.US,
                                             calibPerturbations,
                                             calibPeakCandidateAmp,
                                             calibPeakCandidateDtMs,
                                             widthMs,
+                                            widthOk,
+                                            widthReject,
                                             okAmp,
                                             okDt,
+                                            rejectFirstShortPeak,
                                             countPert
                                         )
                                 )
                                 runOnUiThread {
                                     introStats.text =
-                                        "Enregistrement en cours…\n" +
-                                            "Pas détectés : $calibStepCount\n" +
+                                        "Enregistrement en cours?\n" +
+                                            "Pas detecte : $calibStepCount\n" +
                                             "Perturbations : $calibPerturbations"
                                 }
                                 if (DBG) {
@@ -2069,7 +2128,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         calibPeakArmed = true
                     }
 
-                    // IMPORTANT: mise à jour mémoire (sinon localMax ne marche pas)
+                    // IMPORTANT: mise ? jour m?moire (sinon localMax ne marche pas)
                     prevFilt = lastFilt
                     lastFilt = filtMag
 
@@ -2079,6 +2138,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 if (!navigationActive) return
                 if (navPaused) return
                 if (!stepDetectionEnabled) return
+                if (navState != NavState.READY && navState != NavState.RUNNING) return
 
                 if (detectStepFromPeakNav(filtMag, e.timestamp)) {
                     val nowMs = e.timestamp / 1_000_000L
@@ -2135,9 +2195,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
                         navPaused = false
                         resetNavStepDetectionState()
+                        stepLenNavM = stepLenMUser
+                        Log.i(
+                            TAG,
+                            "NAV START: stepLenNavM=%.3f (from calib stepLenMUser=%.3f)"
+                                .format(Locale.US, stepLenNavM, stepLenMUser)
+                        )
                         navState = NavState.RUNNING
                         udpSendLine("CTRL,START")
-                        Log.i(TAG, "STATE -> RUNNING")
+                        Log.i(TAG, "STATE -> RUNNING (on first step)")
+                        updateNavUi()
                     }
 
 
@@ -2263,7 +2330,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val dir = dirFr(nextInfo.dir)
             if (nextInfo.distM <= 1.0f && lastTurnHintStage < 1) {
                 showTurnHint("Tournez a $dir dans %.1f m".format(Locale.US, nextInfo.distM))
-                vibrate(120)
+                vibeOnce(120)
                 lastTurnHintStage = 1
             }
         }
@@ -2276,11 +2343,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             // 1) vibration 1m avant = deja geree plus haut via nextInfo.distM <= 1.0f
 
             // 2) lock SEULEMENT quand on arrive au point du virage (~20 cm avant)
-            if (turnLockSuppressed && distNowPx >= turnLockSuppressUntilDistPx) {
+            if (turnLockSuppressed && distAlongPx < turnLockSuppressUntilDistPx) {
+                // still suppressed
+            } else {
                 turnLockSuppressed = false
-            }
-            if (turnLockSuppressed) return
-            if (distNowPx >= ev.atDistPx - turnLockLeadPx) {
+                if (distAlongPx >= ev.atDistPx - turnLockLeadPx) {
                 turnLockDir = ev.dir
                 pendingStepsWhileLocked = 0
 
@@ -2297,6 +2364,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
                 startTurnLock(dirRight = ev.dir == "RIGHT")
                 udpSendLine("TURN,${ev.dir}")
+                }
             }
         }
 
@@ -2327,7 +2395,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         turnVibeDone = false
 
         if (!turnVibeDone) {
-            vibrateOnceShort()
+            vibeOnce(140)
             turnVibeDone = true
         }
 
@@ -2489,9 +2557,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 turnLockActive = false
                 pendingStepsWhileLocked = 0
                 turnLockSuppressed = true
-                turnLockSuppressUntilDistPx = distNowPx + max(stepLenPxNav(), turnLockLeadPx)
+                val supPx = (2f * stepLenPxNav()).coerceAtLeast(20f)
+                turnLockSuppressUntilDistPx = distAlongPx + supPx
+                Log.w(
+                    TAG,
+                    "TURN RESET (timeout). Suppress relock until dist=%.1fpx (+%.1fpx)"
+                        .format(Locale.US, turnLockSuppressUntilDistPx, supPx)
+                )
                 udpSendLine("TURN,OK")
-                vibrate(80)
+                vibeOnce(80)
                 return true
             }
         }
@@ -2859,6 +2933,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                                 stepAmpRefUser
                             )
                     )
+                    // Reset peak state to avoid duplicate accepts on the same lobe
+                    navPosLobeStartMs = 0L
+                    navHasPeakCandidate = false
+                    navPeakCandidateAmp = 0f
+                    navPeakCandidateTimeMs = 0L
+                    navPeakCandidateDtMs = 0L
+                    navPeakArmed = true
                     prevFilt = lastFilt
                     lastFilt = filt
                     return true
@@ -2906,12 +2987,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         introStats.text =
             "Enregistrement en cours...\n" +
-            "Marchez normalement. Pas detectes : 0"
+            "Marchez normalement. Nombre d'echantillons : 0"
 
         Log.i(TAG, "CALIB START")
     }
 
-    private fun resetCalibrationToReady(message: String = "Pret(e) quand vous l'etes.") {
+    private fun resetCalibrationToReady(message: String = "Pret. Appuyez sur COMMENCER.") {
         calibActive = false
         calibWaitingStart = true
         stepDetectionEnabled = false
@@ -2952,7 +3033,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         if (calibStepCount !in 5..12) {
             showToast(
-                "Étalonnage invalide ($calibStepCount pas détectés).\nRefaites la marche de 5 m.",
+                "etalonnage invalide ($calibStepCount nombre d'echantillons).\nRefaites la marche de 5 m.",
                 Toast.LENGTH_LONG
             )
             Log.w(TAG, "CALIB REJECT steps=$calibStepCount")
@@ -2961,8 +3042,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             calibStopButton.visibility = View.GONE
             runOnUiThread {
                 introStats.text =
-                    "Résultat incohérent (pas détectés : $calibStepCount).\n" +
-                    "Astuce : marchez normalement, téléphone stable, puis réessayez."
+                    "R?sultat incoh?rent (pas d?tect?s : $calibStepCount).\n" +
+                    "Astuce : marchez normalement, t?l?phone stable, puis r?essayez."
             }
             return
         }
@@ -2991,7 +3072,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 "Etalonnage invalide (pauses ou marche trop lente).\nRefaites les 5 m d'un seul trait.",
                 Toast.LENGTH_LONG
             )
-            Log.w(TAG, "CALIB REJECT dtRef=%.0fms".format(Locale.US, dtRef))
+            Log.w(TAG, "CALIB REJECT dtRef=${dtRef}ms")
             calibWaitingStart = true
             calibButton.visibility = View.VISIBLE
             calibStopButton.visibility = View.GONE
@@ -3034,6 +3115,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         stepRefPeriodMsUser = dtRef
         stepPeriodMs = dtRef
 
+        // IMPORTANT: keep nav step length consistent with calibration
+        stepLenNavM = stepLenMUser
+        Log.i(
+            TAG,
+            "CALIB->NAV STEPLEN sync: stepLenMUser=%.3f stepLenNavM=%.3f"
+                .format(Locale.US, stepLenMUser, stepLenNavM)
+        )
+
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
             .putFloat(PREF_STEP_LEN_M, stepLenMUser)
             .putFloat(PREF_STEP_REF_PERIOD_MS, stepRefPeriodMsUser)
@@ -3052,11 +3141,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
         runOnUiThread {
             introStats.text =
-                "Mesures terminées ?\n\n" +
-                "• Pas détectés : $calibStepCount\n" +
-                "• Longueur de pas : %.2f m\n".format(Locale.US, stepLenMUser) +
-                "• Cadence : %.0f pas/min\n".format(Locale.US, cadenceSpm) +
-                "• Qualité : $vibe\n\n" +
+                "Mesures termin?es ?\n\n" +
+                "? Pas d?tect?s : $calibStepCount\n" +
+                "? Longueur de pas : %.2f m\n".format(Locale.US, stepLenMUser) +
+                "? Cadence : %.0f pas/min\n".format(Locale.US, cadenceSpm) +
+                "? Qualit? : $vibe\n\n" +
                 "Vous pouvez commencer la navigation."
         }
 
@@ -3070,11 +3159,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             navControls.visibility = View.VISIBLE
             updateNavUi()
             // On n'active pas les pas ici: ils s'activeront quand la nav passe RUNNING
-            stepDetectionEnabled = true
+            stepDetectionEnabled = false
             if (mapReady) {
                 requestDraw()
             } else {
-                showToast("Préparation de la carte…")
+                showToast("Pr?paration de la carte?")
             }
         }
 
@@ -4163,6 +4252,3 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         )
     }
 }
-
-
-
