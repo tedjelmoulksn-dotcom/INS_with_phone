@@ -629,10 +629,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val gyroZAlpha = 0.25f
     private val gyroZTurnThreshold = 0.35f
 
-    // =================== UDP ===================
-    private val matlabIP = "192.168.43.18"
-    private val portSend = 30000
-    private val portRecv = 31000
+
     private var yawSmoothPrevDeg: Float? = null
     private var yawAbsContDeg = 0f      // yaw "dÃ©roulÃ©" continu
     private var yawOffsetContDeg = 0f   // offset en continu
@@ -665,23 +662,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val lockMinErrToRequireTurn = 22f // degrÃ©s
 
 
-    // Un seul thread pour tous les envois UDP (anti-threads en rafale)
-    private val udpExec: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "udp-sender").apply { isDaemon = true }
-    }
+
 
     // =================== PATH EXEC ===================
     private val pathExec: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "path-worker").apply { isDaemon = true }
     }
 
-    // =================== CSV LOG ===================
-    private val ENABLE_CSV_LOG = true
-    private val csvExec: ExecutorService = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "csv-logger").apply { isDaemon = true }
-    }
-    @Volatile private var csvWriter: BufferedWriter? = null
-    private var csvLineCount = 0
 
     // =================== DEBUG ===================
     private val TAG = "NAVAPP"
@@ -697,7 +684,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val yawTick = object : Runnable {
         override fun run() {
             try {
-                sendFrameToMatlab()
+
                 if (navigationActive && navState == NavState.RUNNING) {
                     processNavigationLogic(trigger = "TICK")
                 }
@@ -1217,15 +1204,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
 
-        try {
-            socketSend = DatagramSocket().apply { soTimeout = 0 }
-            socketRecv = DatagramSocket(portRecv).apply { soTimeout = 1000 } // timeout pour sortir proprement
-        } catch (e: Exception) {
-            Log.e(TAG, "UDP socket error", e)
-        }
-        udpSendLine("CTRL,PARAM,PXPERM,%.2f" .format(Locale.US,PX_PER_M))
-        udpSendLine("CTRL,PARAM,STEPLEN,%.3f".format(Locale.US, stepLenMUser))
-        udpSendLine("CTRL,PARAM,STEPREFPERIODMS,%.0f".format(Locale.US, stepRefPeriodMsUser))
 
         // Préparation carte dès le lancement, mais on n'affiche rien tant que l’étalonnage n’est pas fini.
                 // Pr?paration carte d?s le lancement (pr?charg?e en arri?re-plan)
@@ -1345,7 +1323,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             true
         }
 
-        startReceiver()
         handler.postDelayed(yawTick, yawTickMs)
     }
     private fun getYawSmoothAbsDegOrNull(): Float? {
@@ -1397,9 +1374,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         socketRecv = null
         socketSend = null
 
-        closeCsvLogger()
-        csvExec.shutdown()
-        udpExec.shutdownNow()
+
         pathExec.shutdownNow()
     }
 
@@ -1495,7 +1470,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         stepDetectionEnabled = false
         yawOffsetLockedToPath = false
         pendingStepsWhileLocked = 0
-        closeCsvLogger()
 
         // distances/path
         cumDistPx = floatArrayOf()
@@ -1557,7 +1531,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         yawSmoothPrevDeg = null
         yawAbsContDeg = 0f
         yawOffsetContDeg = 0f
-        closeCsvLogger()
 
         // distances/path
         cumDistPx = floatArrayOf()
@@ -1840,23 +1813,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 turnLockSuppressed = false
                 turnLockSuppressUntilDistPx = 0f
 
-                // 7) Send to Matlab + UI
-                sendPathToMatlab(computed)
+
+
                 navigationActive = true
                 navState = NavState.READY
                 stepDetectionEnabled = true
-
-                runOnUiThread {
-                    showToast(
-                        "A* ready: %.1fpx (%.1fm), steps=$totalSteps".format(
-                            Locale.US,
-                            totalPx,
-                            distanceM
-                        )
-                    )
-                    draw()
-                }
-
                 Log.i(
                     TAG,
                     "A* PATH ready: n=${computed.size} totalPx=%.1f straightPx=%.1f distanceM=%.2f totalSteps=%d turns=%d"
@@ -2062,19 +2023,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                                         )
                                 )
 
-                                if (DBG) {
-                                    udpSendLine(
-                                        "DBG_CALIB2,ACCEPT,amp=%.3f,dt=%d,width=%d,steps=%d,pert=%d"
-                                            .format(
-                                                Locale.US,
-                                                calibPeakCandidateAmp,
-                                                calibPeakCandidateDtMs,
-                                                widthMs,
-                                                calibStepCount,
-                                                calibPerturbations
-                                            )
-                                    )
-                                }
+
                             } else {
                                 val countPert = calibPeakCandidateAmp >= calibPertMinAmp
                                 if (countPert) {
@@ -2103,20 +2052,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                                             "Pas detecte : $calibStepCount\n" +
                                             "Perturbations : $calibPerturbations"
                                 }
-                                if (DBG) {
-                                    udpSendLine(
-                                        "DBG_CALIB2,REJECT,amp=%.3f,dt=%d,width=%d,okAmp=%b,okDt=%b,pert=%d"
-                                            .format(
-                                                Locale.US,
-                                                calibPeakCandidateAmp,
-                                                calibPeakCandidateDtMs,
-                                                widthMs,
-                                                okAmp,
-                                                okDt,
-                                                calibPerturbations
-                                            )
-                                    )
-                                }
+
                             }
                         }
 
@@ -2202,7 +2138,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                                 .format(Locale.US, stepLenNavM, stepLenMUser)
                         )
                         navState = NavState.RUNNING
-                        udpSendLine("CTRL,START")
+
                         Log.i(TAG, "STATE -> RUNNING (on first step)")
                         updateNavUi()
                     }
@@ -2213,7 +2149,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 // On mÃ©morise juste les pas.
                     if (turnLockActive) {
                         pendingStepsWhileLocked++
-                        udpSendLine("STEP,HOLD,$pendingStepsWhileLocked")
+
                         // On continue la logique pour guider le virage (mais distNowPx ne bouge pas)
                         processNavigationLogic(trigger = "STEP_HOLD")
                         // Optionnel: petit feedback
@@ -2228,12 +2164,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         sentStepCount++
                         val stepPx = stepLenPxNav()
                         distAlongPx = min(totalDistPx, distAlongPx + stepPx)
-                        udpSendLine(
-                            "CTRL,STEPINFO,STEPLENM,%.3f,CAD,%.0f"
-                                .format(Locale.US, stepLenNavM, cadenceSpmNow())
-                        )
                         val nowMs = System.currentTimeMillis()
-                        udpSendLine("STEP_EVT,$sentStepCount,$nowMs")
+
                         updatePositionFromAlongDistance()
                         Log.i(
                             TAG,
@@ -2247,8 +2179,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                                     distAlongPx
                                 )
                         )
+                        if (turnLockActive) {
+                            Log.i(
+                                TAG,
+                                "STEP LOCK stepPx=%.2f distAlongPx=%.1f yawRel=%.1f"
+                                    .format(Locale.US, stepPx, distAlongPx, yawFiltered)
+                            )
+                        }
 
-                        udpSendLine("STEP,$sentStepCount")
+
                         processNavigationLogic(trigger = "STEP")
                         draw()
                     }
@@ -2288,24 +2227,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         val segRel = absToRelMap(segAbs)
 
-        udpSendLine(
-            "DBG,YAW,yawRel=%.1f,segRel=%.1f,dist=%.1f,ratio=%.3f,seg=%d,lock=%b,dir=%s,state=%s,src=%s,mag=%b,drx=%.1f,dry=%.1f"
-                .format(
-                    Locale.US,
-                    yawRel,
-                    segRel,
-                    distNowPx,
-                    ratioNow,
-                    segIdx,
-                    turnLockActive,
-                    turnLockDir,
-                    navState.name,
-                    lastYawSource,
-                    magDisturbed,
-                    drPosPx.x,
-                    drPosPx.y
-                )
-        )
+
 
         val now = System.currentTimeMillis()
         if (DBG && now - lastDbgTime > DBG_PERIOD_MS) {
@@ -2317,7 +2239,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             )
         }
         val turnState = if (turnLockActive) "LOCK_$turnLockDir" else "OK"
-        logCsvLine(yawRel, yawVar, 0f, drPosPx, distNowPx, segIdx, turnState)
         val nextInfo = getNextTurnInfo()
         if (nextInfo == null) {
             lastTurnHintIdx = -1
@@ -2363,7 +2284,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 turnSawLargeErr = false
 
                 startTurnLock(dirRight = ev.dir == "RIGHT")
-                udpSendLine("TURN,${ev.dir}")
+
                 }
             }
         }
@@ -2371,8 +2292,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // 2) validation par gyro Z
         if (turnLockActive) {
             return
-        } else {
-            udpSendLine("TURN,OK")
         }
 
         // fin
@@ -2477,19 +2396,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         remainDeg
                     )
             )
-            // utile aussi via UDP si tu veux
-            udpSendLine(
-                "DBG_TURN,age=$ageMs,phase=$turnGyroPhase,gzRaw=%.3f,gzLp=%.3f,gyroDir=%.3f,hold=%d,turned=%.1f,need=%.1f"
-                    .format(
-                        Locale.US,
-                        gyroZRaw,
-                        turnGyroZLp,
-                        gyroDir,
-                        turnGyroHoldMs,
-                        turnedDeg,
-                        needDeg
-                    )
-            )
+
         }
 
         if (accept || timeout) {
@@ -2528,11 +2435,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         if (pendingStepsWhileLocked > 0) {
             applyPendingSteps()
-            udpSendLine("STEP,$sentStepCount")
+
             draw()
         }
 
-        udpSendLine("TURN,OK")
+
         vibrate(120)
 
         Log.i(
@@ -2564,7 +2471,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     "TURN RESET (timeout). Suppress relock until dist=%.1fpx (+%.1fpx)"
                         .format(Locale.US, turnLockSuppressUntilDistPx, supPx)
                 )
-                udpSendLine("TURN,OK")
+
                 vibeOnce(80)
                 return true
             }
@@ -2623,11 +2530,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             lockOkCount = 0
         }
 
-        // debug UDP
-        udpSendLine(
-            "TURN,LOCK,dir=$turnLockDir,err=%.1f,gz=%.3f,gyroDeg=%.1f,ok=%d,seen=%b"
-                .format(Locale.US, errSigned, lastGyroZ, turnGyroAngleDeg, lockOkCount, turnedEnough)
-        )
+
 
         return false
     }
@@ -2635,9 +2538,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun navCompleted() {
         navState = NavState.FINISHED
         navigationActive = false
-        udpSendLine("CTRL,STOP")
-        udpSendLine("TURN,OK")
-        closeCsvLogger()
+
         vibrate(700)
         Log.i(TAG, "NAV COMPLETED")
         showToast("You made it <3 !", Toast.LENGTH_LONG)
@@ -2833,22 +2734,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val sinceLast = nowMs - lastAcceptedStepMs
         val passThresh = (absLast > thresh || prominenceOk)
         val accept = localMaxAbs && sinceLast > dynMinDelayMs && passThresh
-        if (DBG && localMaxAbs && !accept) {
-            udpSendLine(
-                "DBGSTEP,REJECT,abs=%.4f,th=%.4f,mu=%.4f,sd=%.4f,delay=%d,min=%d,prom=%b,pass=%b"
-                    .format(
-                        Locale.US,
-                        absLast,
-                        thresh,
-                        meanAbs,
-                        stdAbs,
-                        sinceLast,
-                        dynMinDelayMs,
-                        prominenceOk,
-                        passThresh
-                    )
-            )
-        }
+
         if (accept) {
 
             // update periode
@@ -2859,12 +2745,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             peakAbsHold = absLast
 
             lastStepAmpAbs = absLast.coerceAtLeast(0.05f)
-            if (DBG) {
-                udpSendLine(
-                    "DBGSTEP,STEP,abs=%.4f,th=%.4f,mu=%.4f,sd=%.4f,T=%.0f,dt=%d,min=%d"
-                        .format(Locale.US, absLast, thresh, meanAbs, stdAbs, stepPeriodMs, sinceLast, dynMinDelayMs)
-                )
-            }
+
             return true
         }
 
@@ -3712,220 +3593,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // =================== UDP ===================
     private fun udpSendLine(line: String) {
         val sock = socketSend ?: return
-        udpExec.execute {
-            try {
-                val s = "$line\n"
-                val data = s.toByteArray()
-                val p = DatagramPacket(data, data.size, InetAddress.getByName(matlabIP), portSend)
-                sock.send(p)
-            } catch (_: IOException) {
-                // Reseau down / unreachable / pas de route : on ignore (pas de spam log)
-            } catch (_: SecurityException) {
-                // Cas rare: permission reseau / policy : on ignore aussi pour eviter le spam
-            } catch (t: Throwable) {
-                // Vrais bugs (ex: crash inattendu) -> on garde un log
-                Log.e(TAG, "udpSendLine unexpected error", t)
-            }
-        }
+
     }
 
     private fun udpSendBatch(lines: List<String>) {
         if (lines.isEmpty()) return
         val sock = socketSend ?: return
-        udpExec.execute {
-            try {
-                val payload = lines.joinToString(separator = "\n", postfix = "\n")
-                val data = payload.toByteArray()
-                val p = DatagramPacket(data, data.size, InetAddress.getByName(matlabIP), portSend)
-                sock.send(p)
-            } catch (_: IOException) {
-                // Reseau down / unreachable : on ignore (pas de spam log)
-            } catch (_: SecurityException) {
-                // Pareil
-            } catch (t: Throwable) {
-                Log.e(TAG, "udpSendBatch unexpected error", t)
-            }
-        }
+
     }
 
-    private fun sendFrameToMatlab() {
-        getYawFiltered()
-        val lines = ArrayList<String>(7)
-        lines.add(String.format(Locale.US, "CTRL,YAW,%.1f,%.1f", lastYawRawDeg, lastYawSmoothDeg))
-        lines.add(
-            String.format(
-                Locale.US,
-                "CTRL,ACC,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f",
-                lastAccelX,
-                lastAccelY,
-                lastAccelZ,
-                lastAccelXf,
-                lastAccelYf,
-                lastAccelZf
-            )
-        )
-        lines.add(
-            String.format(
-                Locale.US,
-                "CTRL,MAG,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
-                lastMagX,
-                lastMagY,
-                lastMagZ,
-                lastMagNorm,
-                magDeriv,
-                if (magDisturbed) 1 else 0
-            )
-        )
-        lines.add(
-            String.format(
-                Locale.US,
-                "CTRL,ROT,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
-                R[0],
-                R[1],
-                R[2],
-                R[3],
-                R[4],
-                R[5],
-                R[6],
-                R[7],
-                R[8]
-            )
-        )
-        lines.add(
-            String.format(
-                Locale.US,
-                "CTRL,GAME,%.6f,%.6f,%.6f,%.6f",
-                lastGameQuatX,
-                lastGameQuatY,
-                lastGameQuatZ,
-                lastGameQuatW
-            )
-        )
-        lines.add("CTRL,STEP,$sentStepCount")
-        if (sendFrameTimestamp) {
-            val nowMs = System.currentTimeMillis()
-            lines.add("CTRL,TIME,$nowMs")
-        }
-        udpSendBatch(lines)
-    }
-
-
-    private fun sendPathToMatlab(path: List<PointF>) {
-        // construit message une fois (Ã©vite concat dans thread)
-        val sb = StringBuilder("PATH")
-        path.forEach { sb.append(";${it.x},${it.y}") }
-
-        udpSendLine(sb.toString())
-        udpSendLine("CTRL,PARAM,PXPERM,%.2f".format(Locale.US, PX_PER_M))
-        udpSendLine("CTRL,PARAM,STEPLEN,%.3f".format(Locale.US, stepLenMUser))
-        udpSendLine("CTRL,PARAM,HEADING0ABS,%.1f".format(Locale.US, heading0Abs))
-        udpSendLine("CTRL,PARAM,TOTALSTEPS,$totalSteps")
-
-        Log.i(TAG, "Sent PATH + PARAMS to Matlab")
-    }
-
-    private fun logCsvLine(
-        yawRel: Float,
-        yawVar: Float,
-        gyroVar: Float,
-        drPos: PointF,
-        distPx: Float,
-        segIdx: Int,
-        turnState: String
-    ) {
-        if (!ENABLE_CSV_LOG) return
-        try {
-            csvExec.execute {
-                try {
-                    if (csvWriter == null) {
-                        val file = File(filesDir, "nav_${System.currentTimeMillis()}.csv")
-                        csvWriter = BufferedWriter(FileWriter(file, false))
-                        csvWriter?.write("timestampMs,yawRel,yawVar,gyroVar,drX,drY,distPx,segIdx,turnState\n")
-                        csvWriter?.flush()
-                        csvLineCount = 0
-                        Log.i(TAG, "CSV log: ${file.absolutePath}")
-                    }
-                    val ts = System.currentTimeMillis()
-                    val line = String.format(
-                        Locale.US,
-                        "%d,%.1f,%.3f,%.3f,%.2f,%.2f,%.2f,%d,%s\n",
-                        ts,
-                        yawRel,
-                        yawVar,
-                        gyroVar,
-                        drPos.x,
-                        drPos.y,
-                        distPx,
-                        segIdx,
-                        turnState
-                    )
-                    csvWriter?.write(line)
-                    csvLineCount++
-                    if (csvLineCount % 20 == 0) {
-                        csvWriter?.flush()
-                    }
-                } catch (t: Throwable) {
-                    Log.e(TAG, "csv log error", t)
-                }
-            }
-        } catch (_: RejectedExecutionException) {
-        }
-    }
-
-    private fun closeCsvLogger() {
-        if (!ENABLE_CSV_LOG) return
-        try {
-            csvExec.execute {
-                try {
-                    csvWriter?.flush()
-                    csvWriter?.close()
-                } catch (_: Exception) {
-                } finally {
-                    csvWriter = null
-                    csvLineCount = 0
-                }
-            }
-        } catch (_: RejectedExecutionException) {
-            try {
-                csvWriter?.close()
-            } catch (_: Exception) {
-            } finally {
-                csvWriter = null
-                csvLineCount = 0
-            }
-        }
-    }
-
-    private fun startReceiver() {
-        val sock = socketRecv ?: return
-        receiverRunning = true
-
-        recvThread = Thread {
-            val buf = ByteArray(512)
-            while (receiverRunning && !Thread.currentThread().isInterrupted) {
-                try {
-                    val p = DatagramPacket(buf, buf.size)
-                    sock.receive(p) // timeout 1000ms -> permet de checker receiverRunning
-                    val data = String(p.data, 0, p.length).trim()
-                    Log.d(TAG, "RX: $data")
-                } catch (e: SocketTimeoutException) {
-                    // normal, on boucle
-                } catch (e: SocketException) {
-                    // socket fermÃ©
-                    break
-                } catch (e: IOException) {
-                    Log.e(TAG, "Receiver IO error", e)
-                } catch (t: Throwable) {
-                    Log.e(TAG, "Receiver error", t)
-                }
-            }
-            Log.i(TAG, "Receiver stopped")
-        }.apply {
-            name = "udp-receiver"
-            isDaemon = true
-            start()
-        }
-    }
 
     private fun initImageMatrixIfNeeded() {
         if (matrixReady || !mapReady) return
