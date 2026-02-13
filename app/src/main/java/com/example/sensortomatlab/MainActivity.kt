@@ -1929,8 +1929,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
 
             Sensor.TYPE_ACCELEROMETER -> {
-                if (turnLockActive) return
-
                 val ax = e.values[0]
                 val ay = e.values[1]
                 val az = e.values[2]
@@ -2145,52 +2143,39 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
 
                     // Safe update
-                    // Si virage lockÃ© et pas validÃ©, on ne progresse pas sur la carte.
-// On mÃ©morise juste les pas.
+                    // Pendant le lock, on garde exactement la meme logique que hors lock:
+                    // pas compte + avancement carte/flèche immediat.
+                    if (pendingStepsWhileLocked > 0) {
+                        applyPendingSteps()
+                    }
+
+                    sentStepCount++
+                    val stepPx = stepLenPxNav()
+                    distAlongPx = min(totalDistPx, distAlongPx + stepPx)
+
+                    updatePositionFromAlongDistance()
+                    Log.i(
+                        TAG,
+                        "STEP stepPx=%.2f stepLenM=%.3f T=%.0fms cad=%.0fspm distAlongPx=%.1f"
+                            .format(
+                                Locale.US,
+                                stepPx,
+                                stepLenMdynNow(),
+                                stepPeriodMs,
+                                cadenceSpmNow(),
+                                distAlongPx
+                            )
+                    )
                     if (turnLockActive) {
-                        pendingStepsWhileLocked++
-
-                        // On continue la logique pour guider le virage (mais distNowPx ne bouge pas)
-                        processNavigationLogic(trigger = "STEP_HOLD")
-                        // Optionnel: petit feedback
-                        // vibrate(40)
-                        draw()
-                    } else {
-                        // Si on vient de sortir dâ€™un lock, on applique les pas accumulÃ©s dâ€™un coup
-                        if (pendingStepsWhileLocked > 0) {
-                            applyPendingSteps()
-                        }
-
-                        sentStepCount++
-                        val stepPx = stepLenPxNav()
-                        distAlongPx = min(totalDistPx, distAlongPx + stepPx)
-                        val nowMs = System.currentTimeMillis()
-
-                        updatePositionFromAlongDistance()
                         Log.i(
                             TAG,
-                            "STEP stepPx=%.2f stepLenM=%.3f T=%.0fms cad=%.0fspm distAlongPx=%.1f"
-                                .format(
-                                    Locale.US,
-                                    stepPx,
-                                    stepLenMdynNow(),
-                                    stepPeriodMs,
-                                    cadenceSpmNow(),
-                                    distAlongPx
-                                )
+                            "STEP LOCK stepPx=%.2f distAlongPx=%.1f yawRel=%.1f"
+                                .format(Locale.US, stepPx, distAlongPx, yawFiltered)
                         )
-                        if (turnLockActive) {
-                            Log.i(
-                                TAG,
-                                "STEP LOCK stepPx=%.2f distAlongPx=%.1f yawRel=%.1f"
-                                    .format(Locale.US, stepPx, distAlongPx, yawFiltered)
-                            )
-                        }
-
-
-                        processNavigationLogic(trigger = "STEP")
-                        draw()
                     }
+
+                    processNavigationLogic(trigger = if (turnLockActive) "STEP_LOCK" else "STEP")
+                    draw()
 
                 }
             }
@@ -2269,7 +2254,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             } else {
                 turnLockSuppressed = false
                 if (distAlongPx >= ev.atDistPx - turnLockLeadPx) {
-                turnLockDir = ev.dir
+                // Le sens event est inverse par rapport au repere gyro utilise pour le lock.
+                // On inverse ici pour aligner lock (LEFT/RIGHT) avec la rotation reelle.
+                val lockDir = when (ev.dir) {
+                    "LEFT" -> "RIGHT"
+                    "RIGHT" -> "LEFT"
+                    else -> ev.dir
+                }
+                turnLockDir = lockDir
                 pendingStepsWhileLocked = 0
 
                 // Cible du nouveau segment (relatif)
@@ -2283,7 +2275,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 lockMaxYawErrDeg = 0f
                 turnSawLargeErr = false
 
-                startTurnLock(dirRight = ev.dir == "RIGHT")
+                startTurnLock(dirRight = lockDir == "RIGHT")
 
                 }
             }
@@ -2756,8 +2748,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun detectStepFromPeakNav(filt: Float, tsNs: Long): Boolean {
-        if (turnLockActive) return false
-
         val nowMs = tsNs / 1_000_000L
         val absCurr = abs(filt)
         val absLast = abs(lastFilt)
