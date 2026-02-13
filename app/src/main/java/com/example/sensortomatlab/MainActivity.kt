@@ -554,14 +554,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     // =================== TURN / LOCK ===================
     private val TURN_END = 15f
     private val TURN_START = 25f
+    private val largeTurnMinDeg = 60f
     private val deadZone = 8f
     private val correctionThreshold = 18f
 
     // Lock seulement tres proche du point de virage (pas a 1m avant)
     private val turnLockLeadPx = 6f   // ~0.20 m si PX_PER_M=30
 
-    // Validation: on exige alignement yaw sur la nouvelle direction
-    private val turnYawAcceptDeg = TURN_END  // 15 deg
+    // Validation: on exige alignement yaw sur la nouvelle direction (plus strict)
+    private val turnYawAcceptDeg = 10f
+    private val turnYawOkNeeded = 4
 
     // Gyro integration pendant lock (robuste)
     private var turnGyroAngleDeg = 0f
@@ -620,6 +622,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var turnGyroSeen = false
     private var turnGyroPhase = 0
     private var turnGyroStableCount = 0
+    private var turnYawOkStreak = 0
     private val gyroZStableThreshold = 0.08f
     private val gyroZStableNeeded = 6
 
@@ -2142,39 +2145,36 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     }
 
 
-                    // Safe update
-                    // Pendant le lock, on garde exactement la meme logique que hors lock:
-                    // pas compte + avancement carte/flèche immediat.
-                    if (pendingStepsWhileLocked > 0) {
-                        applyPendingSteps()
-                    }
-
-                    sentStepCount++
-                    val stepPx = stepLenPxNav()
-                    distAlongPx = min(totalDistPx, distAlongPx + stepPx)
-
-                    updatePositionFromAlongDistance()
-                    Log.i(
-                        TAG,
-                        "STEP stepPx=%.2f stepLenM=%.3f T=%.0fms cad=%.0fspm distAlongPx=%.1f"
-                            .format(
-                                Locale.US,
-                                stepPx,
-                                stepLenMdynNow(),
-                                stepPeriodMs,
-                                cadenceSpmNow(),
-                                distAlongPx
-                            )
-                    )
+                    // Pendant le lock: on gèle la progression carte/flèche.
+                    // Le virage doit être validé avant d'avancer au segment suivant.
                     if (turnLockActive) {
+                        pendingStepsWhileLocked++
                         Log.i(
                             TAG,
-                            "STEP LOCK stepPx=%.2f distAlongPx=%.1f yawRel=%.1f"
-                                .format(Locale.US, stepPx, distAlongPx, yawFiltered)
+                            "STEP HELD lock=$turnLockDir pending=$pendingStepsWhileLocked distAlongPx=%.1f"
+                                .format(Locale.US, distAlongPx)
                         )
-                    }
+                        processNavigationLogic(trigger = "STEP_LOCK_HELD")
+                    } else {
+                        sentStepCount++
+                        val stepPx = stepLenPxNav()
+                        distAlongPx = min(totalDistPx, distAlongPx + stepPx)
 
-                    processNavigationLogic(trigger = if (turnLockActive) "STEP_LOCK" else "STEP")
+                        updatePositionFromAlongDistance()
+                        Log.i(
+                            TAG,
+                            "STEP stepPx=%.2f stepLenM=%.3f T=%.0fms cad=%.0fspm distAlongPx=%.1f"
+                                .format(
+                                    Locale.US,
+                                    stepPx,
+                                    stepLenMdynNow(),
+                                    stepPeriodMs,
+                                    cadenceSpmNow(),
+                                    distAlongPx
+                                )
+                        )
+                        processNavigationLogic(trigger = "STEP")
+                    }
                     draw()
 
                 }
@@ -2302,6 +2302,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         turnGyroPhase = 0 // 0: waiting opposite lobe, 1: waiting correct lobe
         turnGyroStableCount = 0
+        turnYawOkStreak = 0
 
         turnVibeDone = false
 
@@ -2358,12 +2359,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val turnedDeg = (turnGyroAccumRad * 57.29578f) // already positive-ish because gyroDir integrated
         val needDeg = GYRO_TURN_DEG_MIN
         val remainDeg = (needDeg - turnedDeg).coerceAtLeast(0f)
+        val yawRel = getYawFiltered()
+        val yawErrAbs = abs(angleErrorDeg(turnLockTargetRel, yawRel))
+        if (yawErrAbs <= turnYawAcceptDeg) {
+            turnYawOkStreak++
+        } else {
+            turnYawOkStreak = 0
+        }
+        val yawOk = turnYawOkStreak >= turnYawOkNeeded
 
         val accept =
             (ageMs >= TURN_MIN_LOCK_MS) &&
                 (turnGyroPhase >= 1 || ageMs >= 260L) && // phase optional: after 260ms we don't require pre-lobe
                 (turnGyroHoldMs >= GYRO_HOLD_MS) &&
-                (turnedDeg >= needDeg)
+                (turnedDeg >= needDeg) &&
+                yawOk
 
         val timeout = ageMs > TURN_MAX_LOCK_MS
 
@@ -2375,7 +2385,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 TAG,
                 "TURN LOCK dbg age=${ageMs}ms phase=$turnGyroPhase " +
                     "gzRaw=%.3f gzLp=%.3f dir=%+.0f gyroDir=%.3f ok=%b hold=${turnGyroHoldMs}ms " +
-                    "turned=%.1fdeg need=%.1fdeg rem=%.1fdeg"
+                    "turned=%.1fdeg need=%.1fdeg rem=%.1fdeg yawErr=%.1f yawOk=%b ($turnYawOkStreak/$turnYawOkNeeded)"
                     .format(
                         Locale.US,
                         gyroZRaw,
@@ -2385,13 +2395,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         gyroOk,
                         turnedDeg,
                         needDeg,
-                        remainDeg
+                        remainDeg,
+                        yawErrAbs,
+                        yawOk
                     )
             )
 
         }
 
-        if (accept || timeout) {
+        if (accept) {
             Log.i(
                 TAG,
                 "TURN VALIDATED accept=$accept timeout=$timeout age=${ageMs}ms phase=$turnGyroPhase " +
@@ -2401,6 +2413,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
             turnLockActive = false
             advanceToNextSegment()
+            return
+        }
+
+        if (timeout) {
+            pendingStepsWhileLocked = 0
+            turnGyroHoldMs = 0L
+            turnGyroAccumRad = 0f
+            turnGyroPhase = 0
+            turnYawOkStreak = 0
+            turnStartTsNs = tsNs
+            turnLastTsNs = tsNs
+            Log.w(
+                TAG,
+                "TURN NOT VALIDATED timeout age=${ageMs}ms. Keep lock and wait for real turn."
+            )
         }
     }
 
@@ -2423,14 +2450,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         lockMaxYawErrDeg = 0f
         turnLockStartMs = 0L
         turnLockActive = false
+        turnYawOkStreak = 0
+        pendingStepsWhileLocked = 0
         nextTurnIdx++
-
-        if (pendingStepsWhileLocked > 0) {
-            applyPendingSteps()
-
-            draw()
-        }
-
+        draw()
 
         vibrate(120)
 
@@ -3538,7 +3561,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val a2 = segAngle(i + 1)
             val d = normalizeAngle(a2 - a1)
 
-            if (abs(d) >= 35f) {
+            if (abs(d) >= largeTurnMinDeg) {
                 val dir = if (d > 0) "RIGHT" else "LEFT"
                 val distAt = cd[i + 1]
                 out.add(TurnEvent(distAt, dir, a2))
