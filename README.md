@@ -1,6 +1,6 @@
 # INS with Phone
 
-> **Inertial Navigation System Implementation Using Smartphone Sensors**
+> **Inertial Navigation System with Indoor Path Planning Using Smartphone Sensors**
 
 [![Language](https://img.shields.io/badge/Language-C%2B%2B%20%2F%20Kotlin-blue.svg)](https://kotlinlang.org/)
 [![Android](https://img.shields.io/badge/Android-7.0%2B-green.svg)](https://www.android.com/)
@@ -9,14 +9,15 @@
 
 ## 📍 Overview
 
-**INS with Phone** is a research-grade implementation of an Inertial Navigation System (INS) that leverages smartphone onboard sensors (accelerometer, gyroscope, magnetometer) to estimate position, velocity, and orientation without external positioning signals. This system is ideal for indoor navigation, GPS-denied environments, and real-time motion tracking applications.
+**INS with Phone** is a research-grade implementation of an Inertial Navigation System (INS) combined with indoor path planning that leverages smartphone onboard sensors (accelerometer, gyroscope, magnetometer) to estimate position and provide turn-by-turn navigation guidance within buildings. The system uses the **A* pathfinding algorithm** to compute optimal routes on floor plans and dead reckoning for real-time position tracking in GPS-denied environments.
 
 ### Core Features
 
 - ✅ **Pedestrian Dead Reckoning**: Real-time position estimation through sensor integration
+- ✅ **A* Path Planning**: Optimal pathfinding on indoor floor plans with obstacle avoidance
+- ✅ **Turn-by-Turn Navigation**: Automatic turn detection and guidance based on computed routes
 - ✅ **Orientation Estimation**: 6-DOF (Degrees of Freedom) pose estimation using IMU fusion
 - ✅ **Stride Detection**: Automatic pedestrian step detection and stride length calculation
-- ✅ **Visual Odometry**: OpenCV-based visual feature tracking and motion compensation
 - ✅ **Sensor Calibration**: Automated accelerometer and gyroscope bias correction
 - ✅ **Data Logging**: Comprehensive CSV/JSON export for post-processing analysis
 - ✅ **Multi-Device Support**: Tested on Pixel series, Samsung, OnePlus devices
@@ -25,10 +26,16 @@
 
 | Algorithm | Implementation | Purpose |
 |-----------|---|---|
+| **A* Pathfinding** | Kotlin | Optimal indoor route planning on floor plans |
 | **EKF (Extended Kalman Filter)** | C++ Native | Sensor fusion & state estimation |
 | **Pedestrian Dead Reckoning** | Kotlin/C++ | Position tracking via step counting |
 | **Orientation Estimation** | Android SensorManager | Gyroscope integration with magnetometer |
-| **Visual Odometry** | OpenCV | Motion estimation from camera frames |
+
+### Future Research Directions
+
+- 🔄 **Visual Odometry** (Proposed): OpenCV-based visual feature tracking for enhanced localization accuracy
+- 📡 **WiFi/BLE Fingerprinting**: Integration with wireless signal strength for map correction
+- 🗺️ **Map Learning**: Automatic floor plan generation from user trajectories
 
 ---
 
@@ -54,7 +61,7 @@ Storage:    500MB free space
 Sensors:    Accelerometer (required)
             Gyroscope (required)
             Magnetometer (optional but recommended)
-            Ambient Light Sensor (optional)
+            Camera (optional, for future visual odometry)
 ```
 
 ### Target Devices
@@ -320,9 +327,10 @@ INS_with_phone/
 │   │   │   │
 │   │   │   ├── 📁 java/
 │   │   │   │   └── com/example/sensortomatlab/
-│   │   │   │       ├── MainActivity.kt          # Main UI & control
+│   │   │   │       ├── MainActivity.kt          # Main UI & A* path planning
 │   │   │   │       ├── INSService.kt            # Background INS processing
 │   │   │   │       ├── SensorFusion.kt          # Sensor integration
+│   │   │   │       ├── PathPlanner.kt           # A* algorithm implementation
 │   │   │   │       ├── 📁 model/                # Data models
 │   │   │   │       ├── 📁 ui/                   # Compose UI screens
 │   │   │   │       └── 📁 util/                 # Helper functions
@@ -341,7 +349,7 @@ INS_with_phone/
 │   │   └── androidTest/                # Instrumented tests
 │   │       └── 📁 java/
 │   │
-├── 📁 opencv/                          # OpenCV Android module
+├── 📁 opencv/                          # OpenCV Android module (Future research)
 │   ├── 📄 build.gradle.kts
 │   └── 📁 src/
 │       └── main/
@@ -364,6 +372,11 @@ INS_with_phone/
 └──────────────────┬──────────────────┘
                    │
 ┌──────────────────▼──────────────────┐
+│    Navigation & Path Planning       │
+│  (A* Pathfinding / Turn Detection)  │
+└──────────────────┬──────────────────┘
+                   │
+┌──────────────────▼──────────────────┐
 │    JNI / Native Interface           │
 │  (Kotlin-to-C++ Bridge)            │
 └──────────────────┬──────────────────┘
@@ -383,25 +396,51 @@ INS_with_phone/
 
 ```
 Physical Sensors (Accelerometer, Gyroscope, Magnetometer)
-        ↓
+         ↓
 Android SensorManager (Raw sensor data)
-        ↓
+         ↓
 Kotlin SensorEventListener (Sensor callbacks)
-        ↓
+         ↓
 SensorFusion.kt (Data buffering & formatting)
-        ↓
-JNI Layer (sendToNative_processINS)
-        ↓
+         ↓
 C++ INS Algorithm (ins.cpp / ekf.cpp)
-        ↓
+         ↓
 Kalman Filter State Update (Position, Velocity, Orientation)
-        ↓
-JNI Layer (return results)
-        ↓
-MainActivity.kt (Update UI with position/orientation)
-        ↓
-Visualization & Data Logging (CSV export)
+         ↓
+MainActivity.kt (Position + Path Matching)
+         ↓
+A* Pathfinding (on floor plan bitmap)
+         ↓
+Turn Calculation & Navigation Guidance
+         ↓
+Visualization & Real-time UI Updates
+         ↓
+Data Logging (CSV export)
 ```
+
+---
+
+## 🗺️ Indoor Navigation with A* Algorithm
+
+### How It Works
+
+The A* pathfinding algorithm enables turn-by-turn navigation:
+
+1. **Floor Plan Loading**: User selects a building floor plan (bitmap image)
+2. **Walkability Analysis**: Algorithm identifies traversable areas (white/light regions)
+3. **Start/End Selection**: User taps start and destination points on the map
+4. **Path Computation**: A* finds optimal route avoiding obstacles
+5. **Path Smoothing**: Waypoints are smoothed for natural turns
+6. **Navigation**: User follows step-by-step turn guidance while walking
+
+### A* Implementation Details
+
+The A* algorithm uses an open set (priority queue), closed set, and evaluates nodes based on:
+- **g-cost**: Actual distance from start
+- **h-cost**: Heuristic estimate to goal
+- **f-cost**: g + h (total estimated cost)
+
+This ensures optimal pathfinding while minimizing computation.
 
 ---
 
@@ -419,7 +458,7 @@ Visualization & Data Logging (CSV export)
 <!-- Location (optional, for ground truth comparison) -->
 <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
-<!-- Camera (for visual odometry) -->
+<!-- Camera (optional, for future visual odometry research) -->
 <uses-permission android:name="android.permission.CAMERA" />
 
 <!-- Network (for cloud sync) -->
@@ -435,7 +474,6 @@ Visualization & Data Logging (CSV export)
 ```kotlin
 val INS_PERMISSIONS = arrayOf(
     Manifest.permission.BODY_SENSORS,
-    Manifest.permission.CAMERA,
     Manifest.permission.ACCESS_FINE_LOCATION,
     Manifest.permission.WRITE_EXTERNAL_STORAGE
 )
@@ -464,8 +502,9 @@ const val ACCEL_RANGE_G = 8f       // ±8G
 const val STEP_THRESHOLD = 0.5f    // m/s² acceleration threshold
 const val STRIDE_LENGTH = 0.7f     // meters (average adult step)
 
-// Calibration
-const val CALIBRATION_DURATION_MS = 5000  // 5 seconds for warm-up
+// A* Navigation parameters
+const val PX_PER_M = 30f           // Pixel to meter conversion
+const val A_STAR_STEP_SIZE = 6     // Grid cell size for pathfinding
 ```
 
 ### INS Algorithm Parameters (C++)
@@ -490,6 +529,32 @@ const float MAG_STRENGTH = 50e-6f;
 ---
 
 ## 🐛 Troubleshooting
+
+### ❌ A* Path Not Computing
+
+**Problem:** "A* returned empty path" in logs
+
+**Solutions:**
+```kotlin
+// 1. Check floor plan image
+- Ensure white/light areas represent walkable space
+- Verify image is loaded correctly (non-null bitmap)
+
+// 2. Verify start/end points are on walkable areas
+- Snap points to nearest walkable pixel
+- Use snapToWalkable(point) before A*
+
+// 3. Increase search space if needed
+// Reduce A_STAR_STEP_SIZE for finer granularity
+val step = 3  // instead of 6
+
+// 4. Debug walkability analysis
+fun debugWalkability() {
+    Log.d(TAG, "Walkable cells: ${walkable.count { it }}")
+    Log.d(TAG, "Start walkable: ${isWalkable(sx, sy)}")
+    Log.d(TAG, "End walkable: ${isWalkable(ex, ey)}")
+}
+```
 
 ### ❌ Gradle Sync Failed
 
@@ -706,49 +771,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 }
 ```
 
-### Calling C++ from Kotlin (JNI)
-
-**Kotlin Declaration:**
-```kotlin
-// MainActivity.kt
-external fun nativeProcessINS(sensorData: FloatArray): FloatArray
-
-companion object {
-    init {
-        System.loadLibrary("native_lib")  // Load native_lib.so
-    }
-}
-```
-
-**C++ Implementation:**
-```cpp
-// native_lib.cpp
-#include <jni.h>
-
-extern "C"
-JNIEXPORT jfloatArray JNICALL
-Java_com_example_sensortomatlab_MainActivity_nativeProcessINS(
-    JNIEnv *env,
-    jobject obj,
-    jfloatArray sensorData)
-{
-    // Convert JNI array to C++ vector
-    float *data = env->GetFloatArrayElements(sensorData, NULL);
-    jsize len = env->GetArrayLength(sensorData);
-    
-    // Process through INS algorithm
-    float result[3];
-    processINS(data, result);
-    
-    // Convert result back to JNI array
-    jfloatArray resultArray = env->NewFloatArray(3);
-    env->SetFloatArrayRegion(resultArray, 0, 3, result);
-    
-    env->ReleaseFloatArrayElements(sensorData, data, JNI_ABORT);
-    return resultArray;
-}
-```
-
 ### Kalman Filter (EKF) Implementation
 
 **C++ Core (`ekf.cpp`):**
@@ -830,7 +852,7 @@ This project is licensed under the **MIT License** - see [LICENSE](LICENSE) for 
 
 ```bibtex
 @software{ins_with_phone,
-  title={INS with Phone: Smartphone-based Inertial Navigation System},
+  title={INS with Phone: Smartphone-based Inertial Navigation System with A* Path Planning},
   author={tedjelmoulksn-dotcom},
   year={2026},
   url={https://github.com/tedjelmoulksn-dotcom/INS_with_phone}
@@ -847,10 +869,12 @@ This project is licensed under the **MIT License** - see [LICENSE](LICENSE) for 
 | **Can it work indoors without GPS?** | Yes, that's the primary use case. Perfect for GPS-denied environments. |
 | **What's the battery impact?** | ~15-20% battery drain per hour at 100Hz sampling |
 | **Can I use it with smartwatches?** | Potentially, but requires porting to Wear OS |
-| **How do I improve accuracy?** | Better sensor calibration, EKF tuning, and visual odometry integration |
+| **How do I improve accuracy?** | Better sensor calibration, EKF tuning, and floor plan accuracy |
 | **Is the code open source?** | Yes, MIT License - free for commercial & research use |
-| **Can it detect turns and corners?** | Yes, using gyroscope and magnetometer data |
+| **Can it detect turns and corners?** | Yes, using gyroscope data and A* waypoint guidance |
 | **What about magnetic disturbances?** | Adaptive filtering can mitigate; avoid metal-rich environments |
+| **Can I use custom floor plans?** | Yes! Provide any floor plan image with walkable areas as white/light regions |
+| **What's the planned visual odometry feature?** | OpenCV integration for camera-based localization refinement (future research) |
 
 ---
 
@@ -863,7 +887,7 @@ This project is licensed under the **MIT License** - see [LICENSE](LICENSE) for 
 **When reporting issues, please include:**
 - Device model & Android version
 - INS initialization parameters
-- Sensor type & range used
+- Floor plan dimensions & characteristics
 - Logcat output or crash stack trace
 
 ---
@@ -873,17 +897,20 @@ This project is licensed under the **MIT License** - see [LICENSE](LICENSE) for 
 ### Academic Papers
 - [Dead Reckoning in GPS-Denied Environments](https://arxiv.org/abs/1234567890)
 - [Smartphone Inertial Measurement Unit Calibration](https://ieeexplore.ieee.org/)
+- [A* Pathfinding Algorithm](https://en.wikipedia.org/wiki/A*_search_algorithm)
 
 ### Technical Documentation
 - [Android Sensor Framework](https://developer.android.com/guide/topics/sensors)
 - [Kalman Filter Tutorial](https://en.wikipedia.org/wiki/Kalman_filter)
-- [OpenCV Android SDK](https://opencv.org/android/)
 - [Android NDK Development](https://developer.android.com/ndk)
 
 ### Tools & Libraries
 - [Eigen (Linear Algebra)](http://eigen.tuxfamily.org/)
 - [MATLAB Sensor Fusion](https://www.mathworks.com/help/fusion/)
 - [Google Ceres Solver](http://ceres-solver.org/)
+
+### Future Research References
+- [OpenCV Android SDK](https://opencv.org/android/) - For visual odometry research
 
 ---
 
@@ -895,8 +922,9 @@ This project is licensed under the **MIT License** - see [LICENSE](LICENSE) for 
 
 ---
 
-**Last Updated**: April 2026  
+**Last Updated**: July 2026  
 **Status**: Active Development  
-**Next Release**: v1.1.0 (Visual Odometry Integration)
+**Core Features**: INS + A* Navigation ✅  
+**Next Phase**: Visual Odometry Integration (Research)
 
 </div>
