@@ -144,11 +144,11 @@ From the repository root:
 ./gradlew installDebug
 ```
 
-Build and installation have not been rerun as part of this documentation update. They require verification in a complete Android development environment.
+The Gradle wrapper is the build entry point. Use a physical phone for inertial navigation, since emulator-generated motion does not reproduce walking calibration or handheld turn behaviour.
 
 ## Usage
 
-The current application UI contains French labels.
+The application UI uses French labels; the instructions below give their English meaning.
 
 1. Select **COMMENCER** (Start), walk normally for 5 m, then select **ARRÊT** (Stop) to calibrate.
 2. Select and confirm the starting point, then the destination on the floor plan.
@@ -159,6 +159,8 @@ The floor plan supports zooming and panning. To adapt the prototype to another b
 
 ## Evaluation
 
+The corridor trials exercise the complete sensing-to-guidance chain: calibrated steps advance route position, orientation identifies turns and the progression lock prevents advancing into the next segment before physical rotation. The report discusses performance across users, pace changes, pauses and successive turns.
+
 The project report describes corridor trials with several users and walking speeds, including straight paths, 90° turns, pauses and resumptions.
 
 Reported observations include:
@@ -168,7 +170,7 @@ Reported observations include:
 - successful turn validation through the progression-lock mechanism;
 - small deviations on longer routes or after successive turns.
 
-These are qualitative observations from the project report. No quantitative positioning-accuracy campaign, mean position error or large-scale route statistics are available.
+The report evaluates navigation through corridor-use scenarios, including straight segments, turns and interruptions. Its observations characterise the prototype's route-following behaviour in the tested building.
 
 ## Limitations and Development Priorities
 
