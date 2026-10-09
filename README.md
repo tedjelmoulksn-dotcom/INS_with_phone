@@ -1,145 +1,200 @@
-# Navigation indoor sans GPS sur smartphone Android
+# Android Indoor Navigation
 
-Application Android de guidage piéton à l'intérieur d'un bâtiment, à partir des capteurs du téléphone (accéléromètre, gyroscope et magnétomètre) : détection de pas, estimation du cap, calcul d'itinéraire par A\* sur le plan du bâtiment et validation des virages au gyroscope.
+An Android pedestrian-guidance prototype using smartphone inertial sensors, step detection and floor-plan routing to guide a user indoors without GPS, Bluetooth beacons or Wi-Fi positioning infrastructure.
 
-![Sélection du départ et de la destination sur le plan, puis affichage de l'itinéraire calculé](assets/selection_trajet.jpg)
+**Kotlin · Android Sensor API · Signal Processing · Weighted A* · Inertial Sensing**
 
-*Étapes de définition d'un trajet sur le plan du rez-de-chaussée : choix du départ, choix de la destination, itinéraire calculé (captures issues du rapport de projet).*
+![Start and destination selection followed by the calculated route](assets/selection_trajet.jpg)
 
-## Présentation
+*Route setup on the building floor plan: select the starting point, select the destination and display the calculated path.*
 
-Le GPS n'est pas exploitable à l'intérieur d'un bâtiment. Ce projet étudie une solution qui ne demande aucune infrastructure (ni balises Bluetooth, ni cartographie Wi-Fi) : l'utilisateur indique son point de départ et sa destination sur un plan, l'application calcule un itinéraire, puis fait avancer sa position le long de cet itinéraire à chaque pas détecté.
+## Overview
 
-- **Cadre** : projet de fin d'études, spécialité Instrumentation et Systèmes Embarqués, Sup Galilée (Université Sorbonne Paris Nord), année 2025–2026.
-- **Équipe** : projet réalisé en binôme avec Chaima Jouini, encadré par Christophe Daussy.
-- **Bâtiment de test** : rez-de-chaussée de Sup Galilée, dont le plan est embarqué dans l'application.
+The user selects a starting point and a destination on a stored floor plan. The application computes a route, estimates walking progress from calibrated steps and uses heading and gyroscope measurements to validate turns.
 
-## État du projet
+The estimated position advances **along the planned route**. This is a route-following research prototype, with no independent free-space position estimate or detection of departures from the route.
 
-Projet terminé dans son cadre académique (rapport rendu et soutenance effectuée). L'application fonctionne sur le plan fourni ; elle reste un prototype d'étude et n'est pas maintenue activement. Les limites sont détaillées plus bas.
-
-## Réalisation
-
-Projet réalisé par Tedj El Moulk Sinacer et Chaima Jouini, sous la supervision de Christophe Daussy. Le dépôt rassemble le code de l’application et la documentation du travail mené en binôme.
-
-## Matériel et technologies
-
-| Élément | Détail |
+| Item | Details |
 |---|---|
-| Matériel | Smartphone Android équipé d'un accéléromètre, d'un gyroscope et d'un magnétomètre |
-| Langage | Kotlin (une activité, interface construite avec les vues Android classiques) |
-| Capteurs Android | `TYPE_ACCELEROMETER`, `TYPE_GYROSCOPE`, `TYPE_MAGNETIC_FIELD`, `TYPE_ROTATION_VECTOR`, `TYPE_GAME_ROTATION_VECTOR` (cadence `SENSOR_DELAY_GAME`) |
-| Outils | Android Studio, Gradle 8.13 (wrapper), Android Gradle Plugin 8.13, Kotlin 2.0.21, JDK 17 |
-| Cible | `minSdk` 24, `compileSdk` / `targetSdk` 36 |
+| Context | Final-year academic project, Instrumentation and Embedded Systems, Sup Galilée, Université Sorbonne Paris Nord, 2025–2026 |
+| Authors | Tedj El Moulk Sinacer and Chaima Jouini |
+| Supervisor | Christophe Daussy |
+| Test environment | Ground-floor corridors of Sup Galilée |
+| Status | Academic project completed; research prototype, not actively maintained |
 
-Dépendances déclarées mais non utilisées par le code actuel : le module `opencv/` (SDK OpenCV Android 4.12.0, bibliothèque tierce copiée dans le dépôt), CameraX et PhotoView. Elles datent d'essais antérieurs et sont toujours nécessaires à la compilation tant que la configuration Gradle n'est pas allégée.
+## Key Features
 
-## Principe de fonctionnement
+- Step detection with adaptive band-pass filtering and peak validation.
+- Walking calibration over a known 5 m distance.
+- Heading estimation using Android rotation vectors, with circular smoothing and magnetic-disturbance monitoring.
+- Weighted A* route planning on a floor-plan grid.
+- Gyroscope-based turn validation.
+- On-screen position and heading, route progress and vibration feedback.
+- Pause, resume and restart controls.
 
-Tout le traitement se trouve dans [`MainActivity.kt`](app/src/main/java/com/example/sensortomatlab/MainActivity.kt).
+## Technical Stack
 
-### 1. Détection de pas
+| Component | Implementation |
+|---|---|
+| Language and UI | Kotlin; a single activity with classic Android Views |
+| Hardware | Android smartphone with accelerometer, gyroscope and magnetometer |
+| Sensor interfaces | `TYPE_ACCELEROMETER`, `TYPE_GYROSCOPE`, `TYPE_MAGNETIC_FIELD`, `TYPE_ROTATION_VECTOR`, `TYPE_GAME_ROTATION_VECTOR` |
+| Sensor scheduling | `SENSOR_DELAY_GAME` |
+| Toolchain | Android Studio, Gradle wrapper 8.13, Android Gradle Plugin 8.13, Kotlin 2.0.21, JDK 17 |
+| Android target | `minSdk 24`; `compileSdk / targetSdk 36` |
 
-- Calcul de la norme de l'accélération, puis filtrage par un passe-bande biquad (0,6–3 Hz) dont les coefficients sont recalculés selon la fréquence d'échantillonnage mesurée.
-- Recherche des maxima locaux du signal filtré. Un pic n'est compté comme un pas que si son amplitude, sa largeur (120 à 400 ms) et l'intervalle depuis le pic précédent sont cohérents avec la marche de référence de l'utilisateur.
+The repository also declares OpenCV Android 4.12.0, CameraX and PhotoView dependencies from earlier experiments. They are not used by the current navigation implementation, but remain part of the build configuration.
 
-### 2. Étalonnage de la marche
+## How It Works
 
-![Écrans de l'étalonnage sur 5 mètres](assets/etalonnage_marche.jpg)
+The implementation is in [MainActivity.kt](app/src/main/java/com/example/sensortomatlab/MainActivity.kt).
 
-*Étalonnage : consignes, comptage en cours, puis longueur de pas et cadence obtenues.*
+### 1. Step Detection
 
-Avant la première navigation, l'utilisateur marche sur une distance connue de 5 m. L'application en déduit une longueur de pas, une période de pas de référence (médiane des intervalles) et une amplitude de référence. Un étalonnage est refusé si le nombre de pas détectés est incohérent (hors de 5 à 12) ou si la marche comporte des pauses. Les valeurs sont enregistrées dans les préférences de l'application.
+The acceleration magnitude is filtered through a 0.6–3 Hz biquad band-pass filter. Filter coefficients are recalculated using the measured sampling frequency.
 
-### 3. Estimation du cap
+Local peaks are accepted as steps when their amplitude, width (120–400 ms) and spacing match the user's calibrated walking profile.
 
-- Le cap provient du vecteur de rotation fourni par Android (fusion accéléromètre, gyroscope et magnétomètre réalisée par le système), converti en angles d'Euler.
-- Traitements ajoutés : lissage circulaire (filtre du premier ordre sur le sinus et le cosinus), déroulement de l'angle pour éviter le saut à ±180°, limitation de la vitesse de variation.
-- La norme du champ magnétique est surveillée. En cas de perturbation (valeur hors plage, variation brutale ou écart à la moyenne), l'application bascule sur le vecteur de rotation « game », qui n'utilise pas le magnétomètre.
-- Au démarrage, le cap est aligné sur la direction du premier segment de l'itinéraire.
+### 2. Walking Calibration
 
-Ce projet n'implémente pas de filtre de Kalman ni de filtre de Madgwick : la fusion d'orientation est celle d'Android.
+![Walking calibration screens](assets/etalonnage_marche.jpg)
 
-### 4. Calcul d'itinéraire
+*Calibration instructions, step counting and the resulting stride length and cadence.*
 
-- Le plan (image JPEG) est converti en grille de cases franchissables : pixels blancs, auxquels s'ajoutent les portes repérées par leur couleur (bleu ou orange) sur le plan.
-- Recherche A\* sur une grille au pas de 6 pixels, en 8-connexité, avec une heuristique euclidienne pondérée (coefficient 1,2). Cette pondération accélère la recherche ; le chemin obtenu n'est donc pas garanti strictement le plus court.
-- Simplification du chemin par test de visibilité directe entre points.
-- Les changements de direction d'au moins 60° sont enregistrés comme virages.
+Before navigation, the user walks a known distance of 5 m. The application estimates stride length, the median step interval and a reference peak amplitude, then stores the values in application preferences.
 
-### 5. Suivi de la progression et virages
+Calibration is rejected if the detected count falls outside 5–12 steps or if pauses occur.
 
-- À chaque pas accepté, la position avance de la longueur de pas étalonnée **le long de l'itinéraire calculé** (échelle fixe de 30 pixels par mètre). La position n'est pas calculée librement en deux dimensions.
-- À l'approche d'un virage, la progression est verrouillée. Elle ne reprend que si une rotation réelle est mesurée : intégration de la vitesse angulaire du gyroscope autour de l'axe vertical dans le sens attendu, et cap aligné à 10° près sur la nouvelle direction. Un délai maximal de verrouillage est également prévu dans le code.
-- Retours utilisateur : flèche de position et de cap sur le plan, barre de progression, vibration à l'approche et à la validation d'un virage, boutons Pause, Reprendre et Recommencer.
+### 3. Heading Estimation
 
-![Commandes disponibles pendant la navigation](assets/navigation_controles.jpg)
+Android's rotation vector supplies orientation through platform-provided sensor fusion. Additional processing includes:
 
-*Suivi du trajet avec les commandes Pause, Reprendre et Recommencer.*
+- first-order circular smoothing on sine and cosine components;
+- angle unwrapping around ±180°;
+- rate-of-change limiting;
+- magnetic-field monitoring and fallback to the magnetometer-free game rotation vector when disturbances are detected.
 
-## Organisation du dépôt
+At startup, heading is aligned with the first route segment. The application uses Android's orientation fusion; no custom Kalman or Madgwick filter is implemented.
 
-```
-app/                 Application Android (code Kotlin, ressources, plan du bâtiment)
-opencv/              SDK OpenCV Android 4.12.0 (bibliothèque tierce, non utilisée par le code)
-docs/                Rapport de projet (PDF)
-Rapport/             Support de soutenance conservé à son emplacement initial
-assets/              Captures d'écran utilisées dans ce README
-gradle/, gradlew*    Wrapper Gradle
-```
+### 4. Route Planning
 
-## Installation
+The JPEG floor plan is converted into a traversable grid using white pixels and doors marked in blue or orange.
 
-Prérequis : Android Studio avec un JDK 17, le SDK Android 36, ainsi que le SDK Android 34 pour le module `opencv/`, le NDK et CMake (demandés par ce module).
+Routing uses weighted A* with:
+
+| Parameter | Value |
+|---|---|
+| Grid spacing | 6 pixels |
+| Connectivity | 8 neighbours |
+| Heuristic | Euclidean distance, weighted by 1.2 |
+| Path simplification | Direct line-of-sight checks |
+| Turn detection threshold | Direction change of at least 60° |
+
+The weighted heuristic prioritizes search speed; the resulting path is not guaranteed to be the shortest.
+
+### 5. Progress and Turn Validation
+
+Each accepted step advances the estimated position along the route by the calibrated stride length. The floor-plan scale is fixed at 30 pixels per metre.
+
+Near a turn, progression is locked until a physical rotation is detected through vertical-axis gyroscope integration in the expected direction and heading alignment within 10° of the next segment. The code also includes a maximum lock duration.
+
+![Navigation controls](assets/navigation_controles.jpg)
+
+*Navigation view with pause, resume and restart controls.*
+
+## Repository Structure
+
+| Path | Contents |
+|---|---|
+| `app/` | Kotlin application, Android resources and building floor plan |
+| `assets/` | Screenshots used in this README |
+| `docs/` | Project report |
+| `Rapport/` | Presentation material retained at its original location |
+| `opencv/` | Bundled third-party OpenCV Android SDK |
+| `gradle/`, `gradlew`, `gradlew.bat` | Gradle wrapper |
+| `build.gradle.kts`, `settings.gradle.kts` | Project build configuration |
+
+## Build and Run
+
+### Requirements
+
+- Android Studio and JDK 17.
+- Android SDK 36 for the application.
+- Android SDK 34, NDK and CMake for the bundled OpenCV module.
+- An Android phone with the required sensors and USB debugging enabled.
+
+### Android Studio
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/tedjelmoulksn-dotcom/INS_with_phone.git
+   cd INS_with_phone
+   ```
+
+2. Open the project in Android Studio and allow Gradle synchronization to finish.
+3. Connect the phone and run the `app` configuration.
+
+### Command Line
+
+From the repository root:
 
 ```bash
-git clone https://github.com/tedjelmoulksn-dotcom/INS_with_phone.git
+./gradlew assembleDebug
+./gradlew installDebug
 ```
 
-1. Ouvrir le dossier dans Android Studio et attendre la fin de la synchronisation Gradle.
-2. Brancher un téléphone Android (débogage USB activé) et lancer la configuration `app`.
+Build and installation have not been rerun as part of this documentation update. They require verification in a complete Android development environment.
 
-En ligne de commande : `./gradlew assembleDebug` puis `./gradlew installDebug`.
+## Usage
 
-> Ces commandes n'ont pas été rejouées lors de la mise à jour de cette documentation (pas de SDK Android ni de téléphone dans l'environnement utilisé). La compilation et le fonctionnement sur téléphone restent à vérifier dans un environnement Android complet.
+The current application UI contains French labels.
 
-## Utilisation
+1. Select **COMMENCER** (Start), walk normally for 5 m, then select **ARRÊT** (Stop) to calibrate.
+2. Select and confirm the starting point, then the destination on the floor plan.
+3. Walk while holding the phone steadily in front of you, facing the direction of travel.
+4. At each turn, physically rotate with the phone to validate the new direction and resume progression.
 
-1. **Étalonner** : appuyer sur COMMENCER, marcher normalement 5 m, puis appuyer sur ARRÊT.
-2. **Choisir le départ** sur le plan et valider, puis **choisir la destination** et valider. L'itinéraire s'affiche.
-3. **Marcher** en tenant le téléphone devant soi, orienté dans le sens de la marche. La position avance à chaque pas.
-4. À chaque virage, tourner réellement avec le téléphone pour que la progression reprenne.
+The floor plan supports zooming and panning. To adapt the prototype to another building, replace `app/src/main/res/drawable/rdc_galilee.jpg`, preserve the traversable-area colour conventions and adjust `PX_PER_M`.
 
-Le plan peut être zoomé et déplacé. Pour un autre bâtiment, il faut remplacer l'image `app/src/main/res/drawable/rdc_galilee.jpg` (zones franchissables en blanc) et ajuster la constante d'échelle `PX_PER_M` dans le code.
+## Evaluation
 
-## Essais et résultats
+The project report describes corridor trials with several users and walking speeds, including straight paths, 90° turns, pauses and resumptions.
 
-Les essais ont été réalisés dans les couloirs du rez-de-chaussée de Sup Galilée, avec plusieurs utilisateurs et plusieurs allures de marche : trajets rectilignes, trajets avec virages à 90°, pauses et reprises.
+Reported observations include:
 
-Constats rapportés dans le rapport :
+- stable step detection after calibration, including some incidental movements;
+- consistent travelled-distance estimates after individual stride calibration;
+- successful turn validation through the progression-lock mechanism;
+- small deviations on longer routes or after successive turns.
 
-- détection de pas stable après étalonnage, y compris avec des mouvements parasites ;
-- distance parcourue cohérente une fois la longueur de pas personnalisée ;
-- virages correctement validés par le mécanisme de verrouillage ;
-- légères déviations observées sur les trajets longs ou après plusieurs virages successifs.
+These are qualitative observations from the project report. No quantitative positioning-accuracy campaign, mean position error or large-scale route statistics are available.
 
-Le rapport ne contient pas de campagne de mesures chiffrée (pas d'erreur de position moyenne ni de statistique sur un grand nombre de trajets). Aucun niveau de précision n'est donc annoncé ici.
+## Limitations and Development Priorities
 
-## Limites et travaux restants
+| Current limitation | Development direction |
+|---|---|
+| Floor plan and calibration tied to one building and floor | Configurable map scale and multi-floor support |
+| Progress constrained to the planned route; deviations are not detected | Evaluate independent dead reckoning and external position corrections |
+| Step-count and stride-length errors accumulate | Quantify distance error across users and routes |
+| Stable handheld use required | Evaluate alternative phone carrying positions |
+| Approximately 3,900 lines in one activity | Separate sensing, signal processing, routing and UI modules |
+| Only default generated tests are present | Add tests for step detection, angle handling and route planning |
+| Earlier dependencies remain in the build | Review and remove unused dependencies |
+| Some UI accents have encoding defects | Repair text encoding and add English UI resources |
 
-- Plan, échelle et repères d'étalonnage propres à un seul bâtiment et un seul étage.
-- La position suit l'itinéraire prévu : si l'utilisateur s'en écarte, l'application ne le détecte pas. Des fonctions de navigation à l'estime libre et de recalage sur le chemin existent dans le code mais ne sont pas appelées dans cette version.
-- Une erreur de comptage de pas ou de longueur de pas se reporte directement sur la distance.
-- Le téléphone doit être tenu de manière stable ; l'usage en poche n'a pas été traité.
-- L'envoi des données vers MATLAB par UDP, utilisé pendant le développement pour visualiser les signaux, est désactivé dans cette version (fonctions vides).
-- Tout le code est regroupé dans une seule activité d'environ 3 900 lignes ; un découpage en modules et des tests unitaires restent à faire (seuls les tests générés par défaut sont présents).
-- Certains textes de l'interface présentent des défauts d'encodage des accents.
-- Pistes identifiées dans le rapport : fusion de capteurs plus avancée, recalage ponctuel par balises ou Wi-Fi, gestion de plusieurs étages.
+Free-space dead-reckoning and path-realignment functions exist in the code but are not called in this version. MATLAB UDP streaming used during development is disabled through empty functions.
+
+Further directions identified in the report include advanced sensor fusion and occasional corrections using beacons or Wi-Fi.
 
 ## Documentation
 
-- [Rapport de projet (PDF, 61 pages)](docs/rapport_navigation_indoor.pdf) : étude de l'existant, traitement du signal, architecture, essais.
+[Project report — PDF, 61 pages, French](docs/rapport_navigation_indoor.pdf)
 
-## Licence
+The report covers background research, signal processing, implementation architecture and field trials.
 
-Aucune licence n'a été définie pour le code de l'application. Le module `opencv/` reste soumis à sa licence d'origine (Apache 2.0) et aux licences tierces listées dans `opencv/etc/licenses/`.
+## Authors and Licensing
+
+Developed jointly by **Tedj El Moulk Sinacer** and **Chaima Jouini**, under the supervision of **Christophe Daussy**.
+
+No licence has been specified for the application code. The bundled OpenCV module retains its original Apache 2.0 licence and the third-party notices in `opencv/etc/licenses/`.
