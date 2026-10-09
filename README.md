@@ -1,6 +1,6 @@
 # Android Indoor Navigation
 
-An Android pedestrian-guidance prototype using smartphone inertial sensors, step detection and floor-plan routing to guide a user indoors without GPS, Bluetooth beacons or Wi-Fi positioning infrastructure.
+Android indoor guidance using calibrated steps, inertial sensors and floor-plan routing.
 
 **Kotlin · Android Sensor API · Signal Processing · Weighted A* · Inertial Sensing**
 
