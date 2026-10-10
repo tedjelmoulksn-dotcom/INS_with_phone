@@ -13,3 +13,15 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Journaux et sorties de compilation
+.kotlin/
+**/build/
+*.log
+
+# Fichiers locaux de l'IDE
+/.idea/deviceManager.xml
+/.idea/deploymentTargetSelector.xml
+/.idea/appInsightsSettings.xml
+*.apk
+*.aab
