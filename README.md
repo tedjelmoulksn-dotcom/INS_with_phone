@@ -1,23 +1,31 @@
-# Android Indoor Navigation
+# Smartphone Indoor Navigation
 
-Android research prototype for indoor guidance using calibrated steps, inertial sensing and weighted A* routing. The app advances an estimated position along a selected floor-plan route and checks turns using heading and gyroscope measurements.
+An Android prototype for indoor route guidance using the phone's inertial sensors. The application combines pedestrian motion estimation with path planning on an indoor map.
 
-![Project illustration](assets/selection_trajet.jpg)
+## Technical approach
+
+- Filter acceleration to detect steps and estimate travelled distance.
+- Calibrate stride length over a **5 m** reference distance.
+- Use orientation information and gyroscope measurements to follow heading changes.
+- Compute routes with weighted A* and update navigation from the estimated motion.
+
+The step-detection pipeline uses a **0.6–3 Hz** filtering range. Inertial drift, stride variability and phone orientation affect the resulting position estimate.
 
 ## Repository guide
 
-| Location | Contents |
-|---|---|
-| [app/](app/) | Kotlin application, navigation logic and Android resources |
-| [opencv/](opencv/) | Bundled OpenCV Android module |
-| [docs/](docs/) | Navigation report |
-| [Rapport/](Rapport/) | Project presentation |
-| [assets/](assets/) | Calibration and navigation screenshots |
+| Folder | Contents |
+| --- | --- |
+| [app](app/) | Kotlin application, sensor processing, navigation and Android views |
+| [OpenCV](opencv/) | Bundled OpenCV Android module |
 
-## Getting started
+[Reports](docs/) and [presentation files](Rapport/) accompany the implementation. They provide the detailed methodology and experimental context.
 
-Open the project in Android Studio with JDK 17, synchronise Gradle, and run the app on an Android phone with motion sensors. Select a route and complete the 5 m walking calibration before starting navigation.
+## Build
 
-## Project context
+Open the project in Android Studio with **JDK 17**. The application targets Android SDK 36 and supports API 24 or later. Install the SDK and let Gradle resolve dependencies, then build:
 
-Final-year project by Tedj El Moulk Sinacer and Chaima Jouini, supervised by Christophe Daussy at Sup Galilée. This prototype follows a planned route; it does not independently detect departures from that route.
+```sh
+./gradlew assembleDebug
+```
+
+Test sensor behaviour on a physical Android device. This remains a navigation prototype; the repository does not establish deployment-grade positioning accuracy.
