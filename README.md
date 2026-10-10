@@ -2,6 +2,10 @@
 
 An Android prototype for indoor route guidance using the phone's inertial sensors. The application combines pedestrian motion estimation with path planning on an indoor map.
 
+![INS with phone project overview](assets/navigation_controles.jpg)
+
+*Archived Android navigation screens with route controls and an indoor map. Original UI labels remain in French.*
+
 ## Technical approach
 
 - Filter acceleration to detect steps and estimate travelled distance.
